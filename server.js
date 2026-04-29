@@ -5,40 +5,47 @@ const cors = require('cors');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Enable CORS so your frontend Netlify app can request data from this backend
 app.use(cors());
 
-// Create an endpoint that your frontend will call
 app.get('/api/get-predictions', async (req, res) => {
-    // We grab the fixture ID from the frontend request (e.g., /api/get-predictions?fixture=12345)
     const fixtureId = req.query.fixture;
+    const apiKey = process.env.API_FOOTBALL_KEY;
 
     if (!fixtureId) {
         return res.status(400).json({ error: 'Please provide a fixture ID' });
     }
 
+    if (!apiKey) {
+        console.error("CRITICAL ERROR: API_FOOTBALL_KEY is not defined in Environment Variables.");
+        return res.status(500).json({ error: 'Backend configuration error: API Key missing.' });
+    }
+
     try {
-        // Your Render server makes the request to API-Football securely
         const response = await axios.get('https://v3.football.api-sports.io/predictions', {
-            params: {
-                fixture: fixtureId
-            },
+            params: { fixture: fixtureId },
             headers: {
-                // This pulls the API key you saved in the Render.com Environment Variables tab
-                'x-apisports-key': process.env.API_FOOTBALL_KEY
-            }
+                'x-apisports-key': apiKey,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: 10000 // 10 second timeout
         });
 
-        // Send the real prediction data back to your frontend website
         res.json(response.data);
 
     } catch (error) {
-        console.error("Error fetching data:", error.message);
-        res.status(500).json({ error: 'Failed to fetch predictions' });
+        // This log will show up in your Render "Logs" tab
+        console.error("API Fetch Error:", error.response ? error.response.data : error.message);
+        
+        const statusCode = error.response ? error.response.status : 500;
+        const errorMessage = error.response ? JSON.stringify(error.response.data) : error.message;
+        
+        res.status(statusCode).json({ 
+            error: 'Failed to fetch predictions', 
+            details: errorMessage 
+        });
     }
 });
 
-// Start the server
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
