@@ -1,3 +1,4 @@
+// backend/server.js
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -5,8 +6,34 @@ const cors = require('cors');
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Enable CORS so your website can talk to this server
 app.use(cors());
 
+/**
+ * NEW: Route to fetch live scores from StatPal
+ * Your website will call: https://your-app-name.onrender.com/api/scores
+ */
+app.get('/api/scores', async (req, res) => {
+    // StatPal API Key from Environment Variables
+    const statPalKey = process.env.STATPAL_API_KEY || "98e5c7b5-5b16-412c-a270-c3196e4ef98f";
+    const statPalUrl = "https://statpal.io/api/v1/soccer/livescores";
+
+    try {
+        const response = await axios.get(statPalUrl, {
+            params: { access_key: statPalKey },
+            timeout: 10000
+        });
+        res.json(response.data);
+    } catch (error) {
+        console.error("StatPal API Error:", error.message);
+        res.status(500).json({ error: "Failed to fetch live sports data" });
+    }
+});
+
+/**
+ * EXISTING: Route to fetch predictions from API-Sports
+ * Your website calls: https://your-app-name.onrender.com/api/get-predictions?fixture=ID
+ */
 app.get('/api/get-predictions', async (req, res) => {
     const fixtureId = req.query.fixture;
     const apiKey = process.env.API_FOOTBALL_KEY;
@@ -33,8 +60,7 @@ app.get('/api/get-predictions', async (req, res) => {
         res.json(response.data);
 
     } catch (error) {
-        // This log will show up in your Render "Logs" tab
-        console.error("API Fetch Error:", error.response ? error.response.data : error.message);
+        console.error("API-Sports Fetch Error:", error.response ? error.response.data : error.message);
         
         const statusCode = error.response ? error.response.status : 500;
         const errorMessage = error.response ? JSON.stringify(error.response.data) : error.message;
@@ -47,5 +73,5 @@ app.get('/api/get-predictions', async (req, res) => {
 });
 
 app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
+    console.log(`MagicBettingTips backend running on port ${port}`);
 });
