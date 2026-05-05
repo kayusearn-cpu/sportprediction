@@ -3,6 +3,8 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { Telegraf, Markup } = require('telegraf');
+
+// Use the compatibility/Node-friendly imports for Firebase
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, setDoc, getDoc, updateDoc } = require('firebase/firestore');
 
@@ -31,11 +33,16 @@ if (firebaseConfigStr) {
 // ─── Fetching Helpers ────────────────────────────────────────────────────────
 async function fetchFromStatPal(endpoint, params = {}) {
     const statpalKey = process.env.STATPAL_API_KEY || '98e5c7b5-5b16-412c-a270-c3196e4ef98f';
-    const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
-        params: { ...params, access_key: statpalKey },
-        timeout: 12000
-    });
-    return r.data;
+    try {
+        const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
+            params: { ...params, access_key: statpalKey },
+            timeout: 12000
+        });
+        return r.data;
+    } catch (error) {
+        console.error(`StatPal Error (${endpoint}):`, error.message);
+        throw error;
+    }
 }
 
 // ─── Telegram Bot Logic ──────────────────────────────────────────────────────
@@ -75,8 +82,8 @@ if (botToken) {
 
             if (matches.length === 0) return ctx.reply('❌ No matches found for today.');
 
-            // Create buttons for the first 10 matches (Telegram limit)
-            const buttons = matches.slice(0, 10).map(m => [
+            // Create buttons for matches (limit to avoid Telegram UI clutter)
+            const buttons = matches.slice(0, 15).map(m => [
                 Markup.button.callback(`${m.home} vs ${m.away}`, `select_${m.id}`)
             ]);
 
@@ -104,8 +111,6 @@ if (botToken) {
 
             try {
                 if (db) {
-                    // Save this specific manual tip to a "manual_tips" collection
-                    // The website will look here first
                     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions');
                     const existingSnap = await getDoc(docRef);
                     let currentTips = existingSnap.exists() ? existingSnap.data().tips || {} : {};
@@ -139,7 +144,7 @@ if (botToken) {
         } catch (e) { ctx.reply('❌ Error: ' + e.message); }
     });
 
-    bot.launch();
+    bot.launch().catch(err => console.error("Bot launch failed:", err));
 }
 
 // ─── Web API Endpoints ───────────────────────────────────────────────────────
@@ -163,13 +168,19 @@ app.get('/api/scores', async (req, res) => {
         scores.livescore?.league?.forEach(l => {
             l.match?.forEach(m => {
                 if (manualTips[m.id]) {
-                    m.manual_prediction = manualTips[m.id].tip; // Add your custom tip here
+                    m.manual_prediction = manualTips[m.id].tip; 
                 }
             });
         });
 
         res.json(scores);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { 
+        console.error("API Error:", e.message);
+        res.status(500).json({ error: e.message }); 
+    }
 });
+
+// Basic health check endpoint
+app.get('/', (req, res) => res.send('MagicBettingTips Backend is Running'));
 
 app.listen(port, () => console.log(`Backend running on port ${port}`));
