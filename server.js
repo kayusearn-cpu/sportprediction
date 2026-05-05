@@ -49,6 +49,17 @@ if (botToken) {
     const bot = new Telegraf(botToken);
     const userSession = {};
 
+    // Standard Prediction Options for buttons
+    const PREDICTION_OPTIONS = [
+        ['1 (Home Win)', 'X (Draw)', '2 (Away Win)'],
+        ['1X (Home or Draw)', '12 (Home or Away)', 'X2 (Draw or Away)'],
+        ['Over 1.5', 'Over 2.5', 'Over 3.5'],
+        ['Under 1.5', 'Under 2.5', 'Under 3.5'],
+        ['BTTS - Yes', 'BTTS - No'],
+        ['Home Over 1.5', 'Away Over 1.5'],
+        ['❌ Cancel']
+    ];
+
     const adminMenu = Markup.keyboard([
         ['➕ Add New Prediction', '🔄 Sync Live Data'],
         ['📅 Update Old Matches', '🕒 Update Upcoming'],
@@ -56,13 +67,12 @@ if (botToken) {
     ]).resize();
 
     bot.start((ctx) => {
-        ctx.reply('⚽ *MagicBettingTips Manual Admin*\nUse this bot to manually input your professional predictions.', {
+        ctx.reply('⚽ *MagicBettingTips Manual Admin*\nUse this bot to quickly input your professional predictions using buttons.', {
             parse_mode: 'Markdown',
             ...adminMenu
         });
     });
 
-    // FIXED: Added check to ensure match data is an array before calling forEach
     bot.hears('➕ Add New Prediction', async (ctx) => {
         ctx.reply('⏳ Loading matches for selection...');
         try {
@@ -72,13 +82,11 @@ if (botToken) {
             const leagues = data.livescore?.league;
             if (Array.isArray(leagues)) {
                 leagues.forEach(l => {
-                    // Check if match property exists and is an array
                     if (l.match && Array.isArray(l.match)) {
                         l.match.forEach(m => {
                             matches.push({ id: m.id, home: m.home.name, away: m.away.name });
                         });
                     } else if (l.match && typeof l.match === 'object') {
-                        // If it's a single match object instead of an array
                         const m = l.match;
                         matches.push({ id: m.id, home: m.home.name, away: m.away.name });
                     }
@@ -87,7 +95,6 @@ if (botToken) {
 
             if (matches.length === 0) return ctx.reply('❌ No matches found for today.');
 
-            // Limit display to 10-15 buttons to avoid hitting Telegram limits
             const buttons = matches.slice(0, 10).map(m => [
                 Markup.button.callback(`${m.home} vs ${m.away}`, `select_${m.id}`)
             ]);
@@ -99,21 +106,32 @@ if (botToken) {
         }
     });
 
+    // Handle Match Selection
     bot.action(/select_(.+)/, (ctx) => {
         const matchId = ctx.match[1];
-        userSession[ctx.from.id] = { matchId, step: 'WAITING_FOR_TIP' };
+        userSession[ctx.from.id] = { matchId, step: 'WAITING_FOR_TIP_BUTTON' };
         ctx.answerCbQuery();
-        ctx.reply('📝 Great! Now type your prediction for this match:');
+        
+        ctx.reply('🎯 *Match Selected!* \nSelect your prediction from the options below:', {
+            parse_mode: 'Markdown',
+            ...Markup.keyboard(PREDICTION_OPTIONS).resize().oneTime()
+        });
     });
 
+    // Handle Button Selection or Manual Typing
     bot.on('text', async (ctx) => {
         const userId = ctx.from.id;
         const session = userSession[userId];
         
-        if (session && session.step === 'WAITING_FOR_TIP') {
+        if (session && session.step === 'WAITING_FOR_TIP_BUTTON') {
             const tip = ctx.message.text;
-            const matchId = session.matchId;
 
+            if (tip === '❌ Cancel') {
+                delete userSession[userId];
+                return ctx.reply('Operation cancelled.', adminMenu);
+            }
+
+            const matchId = session.matchId;
             ctx.reply(`⏳ Saving tip: "${tip}"...`);
 
             try {
@@ -130,10 +148,10 @@ if (botToken) {
 
                     await setDoc(docRef, { tips: currentTips }, { merge: true });
                     delete userSession[userId];
-                    ctx.reply('✅ SUCCESS! Your prediction is now live.', adminMenu);
+                    ctx.reply(`✅ SUCCESS! "${tip}" is now live on the website.`, adminMenu);
                 }
             } catch (e) { 
-                ctx.reply('❌ Error saving tip: ' + e.message); 
+                ctx.reply('❌ Error saving tip: ' + e.message, adminMenu); 
             }
         }
     });
