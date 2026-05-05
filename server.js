@@ -3,10 +3,8 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { Telegraf, Markup } = require('telegraf');
-
-// Use the compatibility/Node-friendly imports for Firebase
 const { initializeApp } = require('firebase/app');
-const { getFirestore, doc, setDoc, getDoc, updateDoc } = require('firebase/firestore');
+const { getFirestore, doc, setDoc, getDoc } = require('firebase/firestore');
 
 const app = express();
 const port = process.env.PORT || 10000; 
@@ -36,12 +34,12 @@ async function fetchFromStatPal(endpoint, params = {}) {
     try {
         const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
             params: { ...params, access_key: statpalKey },
-            timeout: 12000
+            timeout: 15000 
         });
         return r.data;
     } catch (error) {
-        console.error(`StatPal Error (${endpoint}):`, error.message);
-        throw error;
+        console.error(`❌ StatPal Error on [${endpoint}]:`, error.response?.data || error.message);
+        throw new Error(`StatPal API failed: ${error.message}`);
     }
 }
 
@@ -49,8 +47,6 @@ async function fetchFromStatPal(endpoint, params = {}) {
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
 if (botToken) {
     const bot = new Telegraf(botToken);
-
-    // Temp state to track what the user is currently predicting
     const userSession = {};
 
     const adminMenu = Markup.keyboard([
@@ -66,48 +62,59 @@ if (botToken) {
         });
     });
 
-    // STEP 1: Start Manual Prediction
+    // FIXED: Added check to ensure match data is an array before calling forEach
     bot.hears('➕ Add New Prediction', async (ctx) => {
-        ctx.reply('⏳ Loading today\'s matches for selection...');
+        ctx.reply('⏳ Loading matches for selection...');
         try {
             const data = await fetchFromStatPal('livescores');
             const matches = [];
             
-            // Flatten matches from leagues
-            data.livescore?.league?.forEach(l => {
-                l.match?.forEach(m => {
-                    matches.push({ id: m.id, home: m.home.name, away: m.away.name });
+            const leagues = data.livescore?.league;
+            if (Array.isArray(leagues)) {
+                leagues.forEach(l => {
+                    // Check if match property exists and is an array
+                    if (l.match && Array.isArray(l.match)) {
+                        l.match.forEach(m => {
+                            matches.push({ id: m.id, home: m.home.name, away: m.away.name });
+                        });
+                    } else if (l.match && typeof l.match === 'object') {
+                        // If it's a single match object instead of an array
+                        const m = l.match;
+                        matches.push({ id: m.id, home: m.home.name, away: m.away.name });
+                    }
                 });
-            });
+            }
 
             if (matches.length === 0) return ctx.reply('❌ No matches found for today.');
 
-            // Create buttons for matches (limit to avoid Telegram UI clutter)
-            const buttons = matches.slice(0, 15).map(m => [
+            // Limit display to 10-15 buttons to avoid hitting Telegram limits
+            const buttons = matches.slice(0, 10).map(m => [
                 Markup.button.callback(`${m.home} vs ${m.away}`, `select_${m.id}`)
             ]);
 
             ctx.reply('👉 Select a match to provide a tip for:', Markup.inlineKeyboard(buttons));
-        } catch (e) { ctx.reply('❌ Error fetching matches: ' + e.message); }
+        } catch (e) { 
+            console.error("Bot selection error:", e);
+            ctx.reply('❌ Error fetching matches: ' + e.message); 
+        }
     });
 
-    // STEP 2: Handle Match Selection
     bot.action(/select_(.+)/, (ctx) => {
         const matchId = ctx.match[1];
         userSession[ctx.from.id] = { matchId, step: 'WAITING_FOR_TIP' };
         ctx.answerCbQuery();
-        ctx.reply('📝 Great! Now type your prediction for this match (e.g., "Home Win @ 1.80" or "Over 2.5 Goals"):');
+        ctx.reply('📝 Great! Now type your prediction for this match:');
     });
 
-    // STEP 3: Handle the typed Prediction text
     bot.on('text', async (ctx) => {
-        const session = userSession[ctx.from.id];
+        const userId = ctx.from.id;
+        const session = userSession[userId];
         
         if (session && session.step === 'WAITING_FOR_TIP') {
             const tip = ctx.message.text;
             const matchId = session.matchId;
 
-            ctx.reply(`⏳ Saving tip: "${tip}" to website...`);
+            ctx.reply(`⏳ Saving tip: "${tip}"...`);
 
             try {
                 if (db) {
@@ -118,27 +125,28 @@ if (botToken) {
                     currentTips[matchId] = {
                         tip: tip,
                         timestamp: new Date().toISOString(),
-                        author: ctx.from.first_name
+                        author: ctx.from.first_name || 'Admin'
                     };
 
-                    await setDoc(docRef, { tips: currentTips });
-                    
-                    delete userSession[ctx.from.id]; // Clear session
-                    ctx.reply('✅ SUCCESS! Your prediction is now live on the website.', adminMenu);
-                } else {
-                    ctx.reply('❌ Firebase not connected.');
+                    await setDoc(docRef, { tips: currentTips }, { merge: true });
+                    delete userSession[userId];
+                    ctx.reply('✅ SUCCESS! Your prediction is now live.', adminMenu);
                 }
-            } catch (e) { ctx.reply('❌ Error saving tip: ' + e.message); }
+            } catch (e) { 
+                ctx.reply('❌ Error saving tip: ' + e.message); 
+            }
         }
     });
 
-    // Basic Sync for data that doesn't need manual tips
     bot.hears('🔄 Sync Live Data', async (ctx) => {
-        ctx.reply('⏳ Syncing match data background...');
+        ctx.reply('⏳ Syncing data...');
         try {
             const data = await fetchFromStatPal('livescores');
             if (db) {
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores'), { ...data, syncTime: new Date().toISOString() });
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores'), { 
+                    ...data, 
+                    syncTime: new Date().toISOString() 
+                });
                 ctx.reply('✅ Match data synced.');
             }
         } catch (e) { ctx.reply('❌ Error: ' + e.message); }
@@ -147,40 +155,27 @@ if (botToken) {
     bot.launch().catch(err => console.error("Bot launch failed:", err));
 }
 
-// ─── Web API Endpoints ───────────────────────────────────────────────────────
-
 app.get('/api/scores', async (req, res) => {
     try {
         let scores = { livescore: { league: [] } };
         let manualTips = {};
-
         if (db) {
-            // 1. Get raw scores
             const scoreSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores'));
             if (scoreSnap.exists()) scores = scoreSnap.data();
-
-            // 2. Get manual tips
             const tipSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions'));
             if (tipSnap.exists()) manualTips = tipSnap.data().tips || {};
         }
 
-        // 3. Merge manual tips into the scores object for the frontend
         scores.livescore?.league?.forEach(l => {
-            l.match?.forEach(m => {
-                if (manualTips[m.id]) {
-                    m.manual_prediction = manualTips[m.id].tip; 
-                }
-            });
+            if (Array.isArray(l.match)) {
+                l.match.forEach(m => {
+                    if (manualTips[m.id]) m.manual_prediction = manualTips[m.id].tip;
+                });
+            }
         });
-
         res.json(scores);
-    } catch (e) { 
-        console.error("API Error:", e.message);
-        res.status(500).json({ error: e.message }); 
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Basic health check endpoint
-app.get('/', (req, res) => res.send('MagicBettingTips Backend is Running'));
-
-app.listen(port, () => console.log(`Backend running on port ${port}`));
+app.get('/', (req, res) => res.send('Backend Online'));
+app.listen(port, () => console.log(`Server on ${port}`));
