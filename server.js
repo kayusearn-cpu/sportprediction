@@ -2,110 +2,174 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { Telegraf, Markup } = require('telegraf'); // Added Markup for buttons
+const { Telegraf, Markup } = require('telegraf');
+const { initializeApp } = require('firebase/app');
+const { getFirestore, doc, setDoc, getDoc, updateDoc } = require('firebase/firestore');
 
 const app = express();
-const port = process.env.PORT || 3000;
-const SM = 'https://api.sportmonks.com/v3/football';
+const port = process.env.PORT || 10000; 
+const appId = "magic-betting-tips"; 
 
 app.use(cors());
 app.use(express.json());
 
-// ─── Telegram Bot Initialization ─────────────────────────────────────────────
+// ─── Firebase Initialization ─────────────────────────────────────────────────
+const firebaseConfigStr = process.env.FIREBASE_CONFIG;
+let db = null;
+
+if (firebaseConfigStr) {
+    try {
+        const firebaseConfig = JSON.parse(firebaseConfigStr);
+        const firebaseApp = initializeApp(firebaseConfig);
+        db = getFirestore(firebaseApp);
+        console.log("🔥 Firebase Firestore connected successfully.");
+    } catch (err) {
+        console.error("❌ Firebase Init Error:", err.message);
+    }
+}
+
+// ─── Fetching Helpers ────────────────────────────────────────────────────────
+async function fetchFromStatPal(endpoint, params = {}) {
+    const statpalKey = process.env.STATPAL_API_KEY || '98e5c7b5-5b16-412c-a270-c3196e4ef98f';
+    const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
+        params: { ...params, access_key: statpalKey },
+        timeout: 12000
+    });
+    return r.data;
+}
+
+// ─── Telegram Bot Logic ──────────────────────────────────────────────────────
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
-let bot;
-
 if (botToken) {
-    bot = new Telegraf(botToken);
+    const bot = new Telegraf(botToken);
 
-    // Main Admin Keyboard
-    const adminKeyboard = Markup.keyboard([
-        ['🔄 Update Live & Predictions', '📅 Update Old Matches'],
-        ['🕒 Update Upcoming Matches', '👁️ Preview Before Send'],
-        ['📝 Edit Posts']
+    // Temp state to track what the user is currently predicting
+    const userSession = {};
+
+    const adminMenu = Markup.keyboard([
+        ['➕ Add New Prediction', '🔄 Sync Live Data'],
+        ['📅 Update Old Matches', '🕒 Update Upcoming'],
+        ['📝 Edit/Delete Posts']
     ]).resize();
 
-    // Handle /start command
     bot.start((ctx) => {
-        ctx.reply('🛠️ MagicBettingTips Admin Panel\nSelect an action to manage the website data:', adminKeyboard);
+        ctx.reply('⚽ *MagicBettingTips Manual Admin*\nUse this bot to manually input your professional predictions.', {
+            parse_mode: 'Markdown',
+            ...adminMenu
+        });
     });
 
-    // 1. Update Live & Predictions
-    bot.hears('🔄 Update Live & Predictions', async (ctx) => {
-        ctx.reply('⏳ Fetching live data and generating predictions...');
+    // STEP 1: Start Manual Prediction
+    bot.hears('➕ Add New Prediction', async (ctx) => {
+        ctx.reply('⏳ Loading today\'s matches for selection...');
         try {
-            // Trigger your internal scoring update
-            const data = await getScoresData();
-            // You can add logic here to "push" to a DB or clear cache
-            ctx.reply(`✅ Success! Live matches updated. (${data.livescore?.league?.length || 0} leagues loaded)`);
-        } catch (error) {
-            ctx.reply('❌ Failed to update live data.');
-        }
+            const data = await fetchFromStatPal('livescores');
+            const matches = [];
+            
+            // Flatten matches from leagues
+            data.livescore?.league?.forEach(l => {
+                l.match?.forEach(m => {
+                    matches.push({ id: m.id, home: m.home.name, away: m.away.name });
+                });
+            });
+
+            if (matches.length === 0) return ctx.reply('❌ No matches found for today.');
+
+            // Create buttons for the first 10 matches (Telegram limit)
+            const buttons = matches.slice(0, 10).map(m => [
+                Markup.button.callback(`${m.home} vs ${m.away}`, `select_${m.id}`)
+            ]);
+
+            ctx.reply('👉 Select a match to provide a tip for:', Markup.inlineKeyboard(buttons));
+        } catch (e) { ctx.reply('❌ Error fetching matches: ' + e.message); }
     });
 
-    // 2. Update Old Matches
-    bot.hears('📅 Update Old Matches', (ctx) => {
-        ctx.reply('🔄 Syncing results for past matches...');
-        // Add logic here to fetch yesterday's scores and update the DB
-        ctx.reply('✅ Old matches updated successfully.');
-    });
-
-    // 3. Update Upcoming Matches
-    bot.hears('🕒 Update Upcoming Matches', async (ctx) => {
-        ctx.reply('🔄 Refreshing upcoming fixtures...');
-        try {
-            // This calls your existing API logic internally
-            // In a real app, you'd save this to your database
-            ctx.reply('✅ Upcoming matches synchronized with the frontend.');
-        } catch (error) {
-            ctx.reply('❌ Error updating upcoming matches.');
-        }
-    });
-
-    // 4. Preview Before Send
-    bot.hears('👁️ Preview Before Send', (ctx) => {
-        ctx.reply('📊 *PREVIEW MODE*\n\nHere is how the next post will look:\n\n⚽ *Match:* Team A vs Team B\n📈 *Prediction:* Home Win (65%)\n🎯 *Score:* 2-0', Markup.inlineKeyboard([
-            [Markup.button.callback('Push to Website', 'push_now')]
-        ]));
-    });
-
-    // 5. Edit Posts
-    bot.hears('📝 Edit Posts', (ctx) => {
-        ctx.reply('✏️ Which post ID would you like to edit? (Send the ID)');
-    });
-
-    // Handle button actions
-    bot.action('push_now', (ctx) => {
+    // STEP 2: Handle Match Selection
+    bot.action(/select_(.+)/, (ctx) => {
+        const matchId = ctx.match[1];
+        userSession[ctx.from.id] = { matchId, step: 'WAITING_FOR_TIP' };
         ctx.answerCbQuery();
-        ctx.editMessageText('🚀 Post has been pushed to the live website!');
+        ctx.reply('📝 Great! Now type your prediction for this match (e.g., "Home Win @ 1.80" or "Over 2.5 Goals"):');
     });
 
-    bot.launch()
-        .then(() => console.log('Telegram Bot with Admin Menu started'))
-        .catch((err) => console.error('Bot Error:', err));
+    // STEP 3: Handle the typed Prediction text
+    bot.on('text', async (ctx) => {
+        const session = userSession[ctx.from.id];
+        
+        if (session && session.step === 'WAITING_FOR_TIP') {
+            const tip = ctx.message.text;
+            const matchId = session.matchId;
 
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+            ctx.reply(`⏳ Saving tip: "${tip}" to website...`);
+
+            try {
+                if (db) {
+                    // Save this specific manual tip to a "manual_tips" collection
+                    // The website will look here first
+                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions');
+                    const existingSnap = await getDoc(docRef);
+                    let currentTips = existingSnap.exists() ? existingSnap.data().tips || {} : {};
+                    
+                    currentTips[matchId] = {
+                        tip: tip,
+                        timestamp: new Date().toISOString(),
+                        author: ctx.from.first_name
+                    };
+
+                    await setDoc(docRef, { tips: currentTips });
+                    
+                    delete userSession[ctx.from.id]; // Clear session
+                    ctx.reply('✅ SUCCESS! Your prediction is now live on the website.', adminMenu);
+                } else {
+                    ctx.reply('❌ Firebase not connected.');
+                }
+            } catch (e) { ctx.reply('❌ Error saving tip: ' + e.message); }
+        }
+    });
+
+    // Basic Sync for data that doesn't need manual tips
+    bot.hears('🔄 Sync Live Data', async (ctx) => {
+        ctx.reply('⏳ Syncing match data background...');
+        try {
+            const data = await fetchFromStatPal('livescores');
+            if (db) {
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores'), { ...data, syncTime: new Date().toISOString() });
+                ctx.reply('✅ Match data synced.');
+            }
+        } catch (e) { ctx.reply('❌ Error: ' + e.message); }
+    });
+
+    bot.launch();
 }
 
-// ─── Data Logic (Remaining the same as your original) ────────────────────────
-let scoresCache = null;
-let scoresCacheTime = 0;
-const SCORES_TTL = 60 * 1000;
+// ─── Web API Endpoints ───────────────────────────────────────────────────────
 
-async function getScoresData() {
-    // ... (Your existing StatPal/Sportmonks logic)
-    // Return the scores object
-}
-
-// ─── API Endpoints ──────────────────────────────────────────────────────────
 app.get('/api/scores', async (req, res) => {
-    const data = await getScoresData();
-    res.json(data);
+    try {
+        let scores = { livescore: { league: [] } };
+        let manualTips = {};
+
+        if (db) {
+            // 1. Get raw scores
+            const scoreSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores'));
+            if (scoreSnap.exists()) scores = scoreSnap.data();
+
+            // 2. Get manual tips
+            const tipSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions'));
+            if (tipSnap.exists()) manualTips = tipSnap.data().tips || {};
+        }
+
+        // 3. Merge manual tips into the scores object for the frontend
+        scores.livescore?.league?.forEach(l => {
+            l.match?.forEach(m => {
+                if (manualTips[m.id]) {
+                    m.manual_prediction = manualTips[m.id].tip; // Add your custom tip here
+                }
+            });
+        });
+
+        res.json(scores);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ... rest of your API routes
-
-app.listen(port, () => { 
-    console.log(`Backend running on port ${port}`); 
-});
+app.listen(port, () => console.log(`Backend running on port ${port}`));
