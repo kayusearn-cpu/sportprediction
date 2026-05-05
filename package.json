@@ -1,18 +1,8 @@
-{
-  "name": "magicbettingtips-backend",
-  "version": "1.0.0",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "axios": "^1.6.0",
-    "cors": "^2.8.5",
+"dependencies": {
+    "firebase": "^10.8.0",
+    "telegraf": "^4.16.3",
     "express": "^4.18.2",
-    "openai": "^4.0.0",
-    "telegraf": "^4.16.3"
-  },
-  "engines": {
-    "node": ">=14.0.0"
-  }
+    "axios": "^1.6.0",
+    "cors": "^2.8.5"
 }
+2.  **Added Error Handling**: Added a try/catch and logging to the `fetchFromStatPal` helper to make debugging easier on Render.
