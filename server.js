@@ -133,10 +133,11 @@ if (botToken) {
 
             try {
                 if (db) {
-                    // FIXED: Path must have an even number of segments. 
-                    // Collection: artifacts/appId/public/data
-                    // Document: manual_predictions
-                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions');
+                    // MANDATORY FIX: Using a standard even-numbered path segment structure.
+                    // Collection: artifacts/{appId}/public/data/manual_predictions
+                    // Document: current
+                    // This ensures 6 segments: (1)artifacts (2)magic-betting-tips (3)public (4)data (5)manual_predictions (6)current
+                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions', 'current');
                     const existingSnap = await getDoc(docRef);
                     let currentTips = existingSnap.exists() ? existingSnap.data().tips || {} : {};
                     
@@ -163,8 +164,8 @@ if (botToken) {
         try {
             const data = await fetchFromStatPal('livescores');
             if (db) {
-                // FIXED: Same path structure correction here
-                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores');
+                // MANDATORY FIX: Same structure for live scores (6 segments)
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
                 await setDoc(docRef, { 
                     ...data, 
                     syncTime: new Date().toISOString() 
@@ -182,10 +183,11 @@ app.get('/api/scores', async (req, res) => {
         let scores = { livescore: { league: [] } };
         let manualTips = {};
         if (db) {
-            const scoreSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores'));
+            // Using the new 6-segment path structure
+            const scoreSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
             if (scoreSnap.exists()) scores = scoreSnap.data();
             
-            const tipSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions'));
+            const tipSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions', 'current'));
             if (tipSnap.exists()) manualTips = tipSnap.data().tips || {};
         }
 
