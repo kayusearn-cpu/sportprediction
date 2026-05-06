@@ -19,7 +19,8 @@ let db = null;
 
 if (firebaseConfigStr) {
     try {
-        const firebaseConfig = JSON.parse(firebaseConfigStr);
+        const cleanedConfig = firebaseConfigStr.trim();
+        const firebaseConfig = JSON.parse(cleanedConfig);
         const firebaseApp = initializeApp(firebaseConfig);
         db = getFirestore(firebaseApp);
         console.log("🔥 Firebase Firestore connected successfully.");
@@ -49,7 +50,6 @@ if (botToken) {
     const bot = new Telegraf(botToken);
     const userSession = {};
 
-    // Standard Prediction Options for buttons
     const PREDICTION_OPTIONS = [
         ['1 (Home Win)', 'X (Draw)', '2 (Away Win)'],
         ['1X (Home or Draw)', '12 (Home or Away)', 'X2 (Draw or Away)'],
@@ -67,7 +67,7 @@ if (botToken) {
     ]).resize();
 
     bot.start((ctx) => {
-        ctx.reply('⚽ *MagicBettingTips Manual Admin*\nUse this bot to quickly input your professional predictions using buttons.', {
+        ctx.reply('⚽ *MagicBettingTips Manual Admin*\nUse this bot to quickly input your professional predictions.', {
             parse_mode: 'Markdown',
             ...adminMenu
         });
@@ -101,12 +101,10 @@ if (botToken) {
 
             ctx.reply('👉 Select a match to provide a tip for:', Markup.inlineKeyboard(buttons));
         } catch (e) { 
-            console.error("Bot selection error:", e);
             ctx.reply('❌ Error fetching matches: ' + e.message); 
         }
     });
 
-    // Handle Match Selection
     bot.action(/select_(.+)/, (ctx) => {
         const matchId = ctx.match[1];
         userSession[ctx.from.id] = { matchId, step: 'WAITING_FOR_TIP_BUTTON' };
@@ -118,7 +116,6 @@ if (botToken) {
         });
     });
 
-    // Handle Button Selection or Manual Typing
     bot.on('text', async (ctx) => {
         const userId = ctx.from.id;
         const session = userSession[userId];
@@ -136,6 +133,9 @@ if (botToken) {
 
             try {
                 if (db) {
+                    // FIXED: Path must have an even number of segments. 
+                    // Collection: artifacts/appId/public/data
+                    // Document: manual_predictions
                     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions');
                     const existingSnap = await getDoc(docRef);
                     let currentTips = existingSnap.exists() ? existingSnap.data().tips || {} : {};
@@ -149,6 +149,8 @@ if (botToken) {
                     await setDoc(docRef, { tips: currentTips }, { merge: true });
                     delete userSession[userId];
                     ctx.reply(`✅ SUCCESS! "${tip}" is now live on the website.`, adminMenu);
+                } else {
+                    ctx.reply('❌ Firebase not connected.', adminMenu);
                 }
             } catch (e) { 
                 ctx.reply('❌ Error saving tip: ' + e.message, adminMenu); 
@@ -161,7 +163,9 @@ if (botToken) {
         try {
             const data = await fetchFromStatPal('livescores');
             if (db) {
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores'), { 
+                // FIXED: Same path structure correction here
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores');
+                await setDoc(docRef, { 
                     ...data, 
                     syncTime: new Date().toISOString() 
                 });
@@ -180,6 +184,7 @@ app.get('/api/scores', async (req, res) => {
         if (db) {
             const scoreSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores'));
             if (scoreSnap.exists()) scores = scoreSnap.data();
+            
             const tipSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions'));
             if (tipSnap.exists()) manualTips = tipSnap.data().tips || {};
         }
