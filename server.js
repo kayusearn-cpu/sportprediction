@@ -133,10 +133,6 @@ if (botToken) {
 
             try {
                 if (db) {
-                    // MANDATORY FIX: Using a standard even-numbered path segment structure.
-                    // Collection: artifacts/{appId}/public/data/manual_predictions
-                    // Document: current
-                    // This ensures 6 segments: (1)artifacts (2)magic-betting-tips (3)public (4)data (5)manual_predictions (6)current
                     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions', 'current');
                     const existingSnap = await getDoc(docRef);
                     let currentTips = existingSnap.exists() ? existingSnap.data().tips || {} : {};
@@ -164,7 +160,6 @@ if (botToken) {
         try {
             const data = await fetchFromStatPal('livescores');
             if (db) {
-                // MANDATORY FIX: Same structure for live scores (6 segments)
                 const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
                 await setDoc(docRef, { 
                     ...data, 
@@ -178,28 +173,54 @@ if (botToken) {
     bot.launch().catch(err => console.error("Bot launch failed:", err));
 }
 
+// ─── Unified API Endpoint for Frontend ──────────────────────────────────────
 app.get('/api/scores', async (req, res) => {
     try {
-        let scores = { livescore: { league: [] } };
+        let scoresData = null;
         let manualTips = {};
+
         if (db) {
-            // Using the new 6-segment path structure
+            // 1. Try to get data from Firestore first
             const scoreSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
-            if (scoreSnap.exists()) scores = scoreSnap.data();
-            
+            if (scoreSnap.exists()) {
+                scoresData = scoreSnap.data();
+            }
+
+            // 2. Get manual tips
             const tipSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions', 'current'));
-            if (tipSnap.exists()) manualTips = tipSnap.data().tips || {};
+            if (tipSnap.exists()) {
+                manualTips = tipSnap.data().tips || {};
+            }
         }
 
-        scores.livescore?.league?.forEach(l => {
-            if (Array.isArray(l.match)) {
-                l.match.forEach(m => {
-                    if (manualTips[m.id]) m.manual_prediction = manualTips[m.id].tip;
-                });
-            }
+        // 3. If no data in Firestore, fetch fresh from API
+        if (!scoresData) {
+            scoresData = await fetchFromStatPal('livescores');
+        }
+
+        // 4. Ensure we have the structure the frontend expects
+        if (!scoresData.livescore) {
+            scoresData = { livescore: scoresData.livescore || { league: [] } };
+        }
+
+        // 5. Inject manual tips into the matches
+        const leagues = Array.isArray(scoresData.livescore?.league) ? scoresData.livescore.league : [scoresData.livescore.league].filter(Boolean);
+        
+        leagues.forEach(l => {
+            const matches = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
+            matches.forEach(m => {
+                if (manualTips[m.id]) {
+                    // This creates the manual_prediction field the frontend uses
+                    m.manual_prediction = manualTips[m.id].tip;
+                }
+            });
         });
-        res.json(scores);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+
+        res.json(scoresData);
+    } catch (e) { 
+        console.error("API /api/scores error:", e.message);
+        res.status(500).json({ error: e.message }); 
+    }
 });
 
 app.get('/', (req, res) => res.send('Backend Online'));
