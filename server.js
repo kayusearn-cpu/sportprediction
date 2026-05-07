@@ -22,13 +22,13 @@ if (firebaseConfigStr) {
         const firebaseConfig = JSON.parse(cleanedConfig);
         const firebaseApp = initializeApp(firebaseConfig);
         db = getFirestore(firebaseApp);
-        console.log("🔥 Firebase Firestore connected successfully.");
+        console.log("🔥 Firebase connected.");
     } catch (err) {
-        console.error("❌ Firebase Init Error:", err.message);
+        console.error("❌ Firebase Error:", err.message);
     }
 }
 
-// ─── Fetching Helpers ────────────────────────────────────────────────────────
+// ─── Fetching Helper ────────────────────────────────────────────────────────
 async function fetchFromStatPal(endpoint, params = {}) {
     const statpalKey = process.env.STATPAL_API_KEY || '98e5c7b5-5b16-412c-a270-c3196e4ef98f';
     try {
@@ -38,8 +38,8 @@ async function fetchFromStatPal(endpoint, params = {}) {
         });
         return r.data;
     } catch (error) {
-        console.error(`❌ StatPal Error on [${endpoint}]:`, error.message);
-        return { livescore: { league: [] } };
+        console.error(`❌ API Error:`, error.message);
+        return null;
     }
 }
 
@@ -58,128 +58,88 @@ if (botToken) {
     ];
 
     const adminMenu = Markup.keyboard([
-        ['➕ Add New Prediction', '🔄 Sync Match Data'],
-        ['📝 Edit/Delete Posts']
+        ['➕ Add New Prediction', '🔄 Sync Match Data']
     ]).resize();
 
-    bot.start((ctx) => {
-        ctx.reply('⚽ *Magic Analysis Expert Panel*\nManage your professional daily predictions.', {
-            parse_mode: 'Markdown',
-            ...adminMenu
-        });
-    });
+    bot.start((ctx) => ctx.reply('⚽ *Magic Admin*\nUse buttons below to manage tips.', { parse_mode: 'Markdown', ...adminMenu }));
 
-    // STEP 1: Select Category
     bot.hears('➕ Add New Prediction', (ctx) => {
-        ctx.reply('Which match category are you predicting?', Markup.inlineKeyboard([
-            [Markup.button.callback('🔴 Live Matches', 'cat_live')],
-            [Markup.button.callback('🔵 Upcoming Matches', 'cat_upcoming')],
-            [Markup.button.callback('✅ Past Results', 'cat_past')]
+        ctx.reply('Select category:', Markup.inlineKeyboard([
+            [Markup.button.callback('🔴 Live', 'cat_live')],
+            [Markup.button.callback('🔵 Upcoming', 'cat_upcoming')],
+            [Markup.button.callback('✅ Past', 'cat_past')]
         ]));
     });
 
-    // STEP 2: Load Matches based on Category
     bot.action(/cat_(.+)/, async (ctx) => {
         const category = ctx.match[1];
         ctx.answerCbQuery();
-        ctx.reply(`⏳ Loading ${category} matches for selection...`);
+        ctx.reply(`⏳ Loading ${category}...`);
         
-        try {
-            let data;
-            if (category === 'upcoming') {
-                const tomorrow = new Date(); 
-                tomorrow.setDate(tomorrow.getDate() + 1);
-                data = await fetchFromStatPal('fixtures', { date: tomorrow.toISOString().split('T')[0] });
-            } else {
-                data = await fetchFromStatPal('livescores');
-            }
+        const data = category === 'upcoming' 
+            ? await fetchFromStatPal('fixtures', { date: new Date(Date.now() + 86400000).toISOString().split('T')[0] })
+            : await fetchFromStatPal('livescores');
 
-            const matches = [];
-            const leagues = data.livescore?.league || (Array.isArray(data.data) ? [{match: data.data}] : []);
-            
-            leagues.forEach(l => {
-                const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
-                items.forEach(m => {
-                    const status = m.status || '';
-                    const isFin = ['FT', 'AET', 'PEN'].includes(status);
-                    const isUpc = ['NS', 'TBD'].includes(status) || /^\d{2}:\d{2}$/.test(status);
+        if (!data || !data.livescore) return ctx.reply('❌ API Error or no matches.');
 
-                    if (category === 'live' && !isFin && !isUpc) matches.push(m);
-                    else if (category === 'past' && isFin) matches.push(m);
-                    else if (category === 'upcoming' && isUpc) matches.push(m);
-                });
+        const matches = [];
+        const leagues = Array.isArray(data.livescore.league) ? data.livescore.league : [data.livescore.league];
+        
+        leagues.forEach(l => {
+            const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
+            items.forEach(m => {
+                const status = m.status || '';
+                const isFin = ['FT', 'AET', 'PEN'].includes(status);
+                const isUpc = ['NS', 'TBD'].includes(status) || /^\d{2}:\d{2}$/.test(status);
+
+                if (category === 'live' && !isFin && !isUpc) matches.push(m);
+                else if (category === 'past' && isFin) matches.push(m);
+                else if (category === 'upcoming' && isUpc) matches.push(m);
             });
+        });
 
-            if (matches.length === 0) return ctx.reply('❌ No matches found in this category.');
+        if (matches.length === 0) return ctx.reply('❌ None found.');
 
-            // Limit to 10 for manual selection
-            const buttons = matches.slice(0, 10).map(m => [
-                Markup.button.callback(`${m.home.name} vs ${m.away.name}`, `select_${m.id}`)
-            ]);
-            ctx.reply('👉 Select a match to predict:', Markup.inlineKeyboard(buttons));
-        } catch (e) { ctx.reply('❌ Error fetching: ' + e.message); }
+        const buttons = matches.slice(0, 10).map(m => [Markup.button.callback(`${m.home.name} vs ${m.away.name}`, `select_${m.id}`)]);
+        ctx.reply('👉 Choose match:', Markup.inlineKeyboard(buttons));
     });
 
-    // STEP 3: Handle Match Selection
     bot.action(/select_(.+)/, (ctx) => {
-        const matchId = ctx.match[1];
-        userSession[ctx.from.id] = { matchId, step: 'WAITING_FOR_TIP' };
+        userSession[ctx.from.id] = { matchId: ctx.match[1], step: 'WAITING_FOR_TIP' };
         ctx.answerCbQuery();
-        ctx.reply('🎯 Select your expert tip:', Markup.keyboard(PREDICTION_OPTIONS).resize());
+        ctx.reply('🎯 Select tip:', Markup.keyboard(PREDICTION_OPTIONS).resize());
     });
 
-    // STEP 4: Save Tip to Firestore
     bot.on('text', async (ctx) => {
-        const userId = ctx.from.id;
-        const session = userSession[userId];
-        
-        if (session && session.step === 'WAITING_FOR_TIP') {
-            const tip = ctx.message.text;
-            if (tip === '❌ Cancel') { 
-                delete userSession[userId]; 
-                return ctx.reply('Cancelled.', adminMenu); 
-            }
-
+        const session = userSession[ctx.from.id];
+        if (session?.step === 'WAITING_FOR_TIP') {
+            if (ctx.message.text === '❌ Cancel') { delete userSession[ctx.from.id]; return ctx.reply('Cancelled.', adminMenu); }
             try {
                 if (db) {
                     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions', 'current');
-                    const existingSnap = await getDoc(docRef);
-                    let currentTips = existingSnap.exists() ? existingSnap.data().tips || {} : {};
-                    
-                    // Add/Update the tip
-                    currentTips[session.matchId] = { 
-                        tip, 
-                        timestamp: new Date().toISOString() 
-                    };
-                    
-                    await setDoc(docRef, { tips: currentTips });
-                    delete userSession[userId];
-                    ctx.reply(`✅ Success! "${tip}" is now live on the website.`, adminMenu);
+                    const snap = await getDoc(docRef);
+                    let tips = snap.exists() ? snap.data().tips || {} : {};
+                    tips[session.matchId] = { tip: ctx.message.text, time: new Date().toISOString() };
+                    await setDoc(docRef, { tips });
+                    delete userSession[ctx.from.id];
+                    ctx.reply(`✅ Saved: ${ctx.message.text}`, adminMenu);
                 }
-            } catch (e) { ctx.reply('❌ Save Error: ' + e.message, adminMenu); }
+            } catch (e) { ctx.reply('❌ Error: ' + e.message); }
         }
     });
 
-    // Manual Sync Button
     bot.hears('🔄 Sync Match Data', async (ctx) => {
-        ctx.reply('⏳ Syncing latest fixtures to database...');
-        try {
-            const data = await fetchFromStatPal('livescores');
-            if (db) {
-                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
-                await setDoc(docRef, { 
-                    ...data, 
-                    syncTime: new Date().toISOString() 
-                });
-                ctx.reply('✅ Match data synced successfully.');
-            }
-        } catch (e) { ctx.reply('❌ Sync Error: ' + e.message); }
+        const data = await fetchFromStatPal('livescores');
+        if (db && data) {
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), data);
+            ctx.reply('✅ Synced.');
+        }
     });
 
-    bot.launch().then(() => console.log('🤖 Bot Online'));
+    bot.launch();
 }
 
-// ─── API for Website ─────────────────────────────────────────────────────────
+// ─── API Endpoint (Fixed for Frontend) ───────────────────────────────────────
 app.get('/api/scores', async (req, res) => {
     try {
         let scoresData = { livescore: { league: [] } };
@@ -188,29 +148,32 @@ app.get('/api/scores', async (req, res) => {
         if (db) {
             const scoreSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
             if (scoreSnap.exists()) scoresData = scoreSnap.data();
-            
             const tipSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions', 'current'));
             if (tipSnap.exists()) manualTips = tipSnap.data().tips || {};
         }
 
-        // Flatten all matches and inject the expert tips
-        const flatMatches = [];
-        const leagues = scoresData.livescore?.league || [];
-        (Array.isArray(leagues) ? leagues : [leagues]).forEach(lg => {
+        // If Firestore is empty, fetch fresh for the first time
+        if (scoresData.livescore.league.length === 0) {
+            const fresh = await fetchFromStatPal('livescores');
+            if (fresh) scoresData = fresh;
+        }
+
+        // Inject manual tips
+        const leagues = Array.isArray(scoresData.livescore.league) ? scoresData.livescore.league : [scoresData.livescore.league].filter(Boolean);
+        leagues.forEach(lg => {
             const ms = Array.isArray(lg.match) ? lg.match : [lg.match].filter(Boolean);
             ms.forEach(m => {
-                // If this match has a tip in Firestore, add it to the object
-                if (manualTips[m.id]) {
-                    m.manual_prediction = manualTips[m.id].tip;
-                }
-                flatMatches.push({...m, leagueName: lg.name, country: lg.country});
+                if (manualTips[m.id]) m.manual_prediction = manualTips[m.id].tip;
             });
         });
 
-        // Return simplified object for the updated frontend
-        res.json({ matches: flatMatches });
+        // Send data in BOTH formats
+        res.json({
+            ...scoresData,        // OLD FORMAT: livescore { league: [...] }
+            matches: []           // placeholder for new format if needed later
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (req, res) => res.send('Magic Analysis API is Running'));
-app.listen(port, () => console.log(`Server live on port ${port}`));
+app.get('/', (req, res) => res.send('API Running'));
+app.listen(port, () => console.log(`Live on ${port}`));
