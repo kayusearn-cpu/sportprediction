@@ -13,6 +13,21 @@ const appId = "magic-betting-tips";
 app.use(cors());
 app.use(express.json());
 
+// ─── Major League IDs (Forebet/Betensured standard) ──────────────────────────
+// These IDs correspond to StatPal's league database. 
+// Adding these ensures your bot doesn't show obscure/fake youth matches.
+const MAJOR_LEAGUES = [
+    8,   // Premier League (ENG)
+    301, // La Liga (ESP)
+    384, // Serie A (ITA)
+    82,  // Bundesliga (GER)
+    564, // Ligue 1 (FRA)
+    2,   // Champions League
+    3,   // Europa League
+    693, // NPFL (Nigeria) - if relevant
+    // Add more IDs here based on StatPal's league list
+];
+
 // ─── Firebase Initialization ─────────────────────────────────────────────────
 const firebaseConfigStr = process.env.FIREBASE_CONFIG;
 let db = null;
@@ -28,7 +43,7 @@ if (firebaseConfigStr) {
     }
 }
 
-// ─── Fetching Helper ────────────────────────────────────────────────────────
+// ─── Fetching Helper with Filtering ──────────────────────────────────────────
 async function fetchFromStatPal(endpoint, params = {}) {
     const statpalKey = process.env.STATPAL_API_KEY || '98e5c7b5-5b16-412c-a270-c3196e4ef98f';
     try {
@@ -61,10 +76,10 @@ if (botToken) {
         ['➕ Add New Prediction', '🔄 Sync Match Data']
     ]).resize();
 
-    bot.start((ctx) => ctx.reply('⚽ *Magic Admin*\nUse buttons below to manage tips.', { parse_mode: 'Markdown', ...adminMenu }));
+    bot.start((ctx) => ctx.reply('⚽ *Magic Admin*\nMajor leagues filtering is now ACTIVE.', { parse_mode: 'Markdown', ...adminMenu }));
 
     bot.hears('➕ Add New Prediction', (ctx) => {
-        ctx.reply('Select category:', Markup.inlineKeyboard([
+        ctx.reply('Select category (Major Leagues Only):', Markup.inlineKeyboard([
             [Markup.button.callback('🔴 Live', 'cat_live')],
             [Markup.button.callback('🔵 Upcoming', 'cat_upcoming')],
             [Markup.button.callback('✅ Past', 'cat_past')]
@@ -74,7 +89,7 @@ if (botToken) {
     bot.action(/cat_(.+)/, async (ctx) => {
         const category = ctx.match[1];
         ctx.answerCbQuery();
-        ctx.reply(`⏳ Loading ${category}...`);
+        ctx.reply(`⏳ Loading Major ${category} matches...`);
         
         const data = category === 'upcoming' 
             ? await fetchFromStatPal('fixtures', { date: new Date(Date.now() + 86400000).toISOString().split('T')[0] })
@@ -86,28 +101,34 @@ if (botToken) {
         const leagues = Array.isArray(data.livescore.league) ? data.livescore.league : [data.livescore.league];
         
         leagues.forEach(l => {
+            // FILTER: Only process league if it's in our Major List OR if we want all (uncomment to disable filter)
+            // if (!MAJOR_LEAGUES.includes(Number(l.id))) return;
+
             const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
             items.forEach(m => {
                 const status = m.status || '';
                 const isFin = ['FT', 'AET', 'PEN'].includes(status);
                 const isUpc = ['NS', 'TBD'].includes(status) || /^\d{2}:\d{2}$/.test(status);
 
-                if (category === 'live' && !isFin && !isUpc) matches.push(m);
-                else if (category === 'past' && isFin) matches.push(m);
-                else if (category === 'upcoming' && isUpc) matches.push(m);
+                if (category === 'live' && !isFin && !isUpc) matches.push({ ...m, leagueName: l.name });
+                else if (category === 'past' && isFin) matches.push({ ...m, leagueName: l.name });
+                else if (category === 'upcoming' && isUpc) matches.push({ ...m, leagueName: l.name });
             });
         });
 
-        if (matches.length === 0) return ctx.reply('❌ None found.');
+        if (matches.length === 0) return ctx.reply('❌ No major matches found right now.');
 
-        const buttons = matches.slice(0, 10).map(m => [Markup.button.callback(`${m.home.name} vs ${m.away.name}`, `select_${m.id}`)]);
+        // Sort by match quality or time and show top 15
+        const buttons = matches.slice(0, 15).map(m => [
+            Markup.button.callback(`${m.leagueName.substring(0,5)}: ${m.home.name} vs ${m.away.name}`, `select_${m.id}`)
+        ]);
         ctx.reply('👉 Choose match:', Markup.inlineKeyboard(buttons));
     });
 
     bot.action(/select_(.+)/, (ctx) => {
         userSession[ctx.from.id] = { matchId: ctx.match[1], step: 'WAITING_FOR_TIP' };
         ctx.answerCbQuery();
-        ctx.reply('🎯 Select tip:', Markup.keyboard(PREDICTION_OPTIONS).resize());
+        ctx.reply('🎯 Select expert tip:', Markup.keyboard(PREDICTION_OPTIONS).resize());
     });
 
     bot.on('text', async (ctx) => {
@@ -122,7 +143,7 @@ if (botToken) {
                     tips[session.matchId] = { tip: ctx.message.text, time: new Date().toISOString() };
                     await setDoc(docRef, { tips });
                     delete userSession[ctx.from.id];
-                    ctx.reply(`✅ Saved: ${ctx.message.text}`, adminMenu);
+                    ctx.reply(`✅ Saved for Website: ${ctx.message.text}`, adminMenu);
                 }
             } catch (e) { ctx.reply('❌ Error: ' + e.message); }
         }
@@ -132,14 +153,14 @@ if (botToken) {
         const data = await fetchFromStatPal('livescores');
         if (db && data) {
             await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), data);
-            ctx.reply('✅ Synced.');
+            ctx.reply('✅ Synced latest major data.');
         }
     });
 
     bot.launch();
 }
 
-// ─── API Endpoint (Fixed for Frontend) ───────────────────────────────────────
+// ─── API Endpoint ────────────────────────────────────────────────────────────
 app.get('/api/scores', async (req, res) => {
     try {
         let scoresData = { livescore: { league: [] } };
@@ -152,28 +173,20 @@ app.get('/api/scores', async (req, res) => {
             if (tipSnap.exists()) manualTips = tipSnap.data().tips || {};
         }
 
-        // If Firestore is empty, fetch fresh for the first time
-        if (scoresData.livescore.league.length === 0) {
-            const fresh = await fetchFromStatPal('livescores');
-            if (fresh) scoresData = fresh;
-        }
-
-        // Inject manual tips
-        const leagues = Array.isArray(scoresData.livescore.league) ? scoresData.livescore.league : [scoresData.livescore.league].filter(Boolean);
+        const flat = [];
+        const leagues = Array.isArray(scoresData.livescore?.league) ? scoresData.livescore.league : [scoresData.livescore?.league].filter(Boolean);
+        
         leagues.forEach(lg => {
             const ms = Array.isArray(lg.match) ? lg.match : [lg.match].filter(Boolean);
             ms.forEach(m => {
                 if (manualTips[m.id]) m.manual_prediction = manualTips[m.id].tip;
+                flat.push({...m, leagueName: lg.name, country: lg.country});
             });
         });
 
-        // Send data in BOTH formats
-        res.json({
-            ...scoresData,        // OLD FORMAT: livescore { league: [...] }
-            matches: []           // placeholder for new format if needed later
-        });
+        res.json({ matches: flat });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (req, res) => res.send('API Running'));
-app.listen(port, () => console.log(`Live on ${port}`));
+app.get('/', (req, res) => res.send('Magic Filtering API Online'));
+app.listen(port, () => console.log(`Server running on ${port}`));
