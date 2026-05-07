@@ -13,27 +13,6 @@ const appId = "magic-betting-tips";
 app.use(cors());
 app.use(express.json());
 
-/**
- * ─── Major League IDs ────────────────────────────────────────────────────────
- * These IDs filter the massive StatPal database to only show high-tier leagues.
- * This aligns your data with sites like Forebet and Betensured.
- */
-const MAJOR_LEAGUES = [
-    8,   // Premier League (ENG)
-    301, // La Liga (ESP)
-    384, // Serie A (ITA)
-    82,  // Bundesliga (GER)
-    564, // Ligue 1 (FRA)
-    2,   // Champions League
-    3,   // Europa League
-    693, // NPFL (Nigeria)
-    400, // Eredivisie (NED)
-    462, // Primeira Liga (POR)
-    556, // Serie A (BRA)
-    1,   // World Cup / Major Internationals
-    // Add more IDs here as needed
-];
-
 // ─── Firebase Initialization ─────────────────────────────────────────────────
 const firebaseConfigStr = process.env.FIREBASE_CONFIG;
 let db = null;
@@ -49,24 +28,75 @@ if (firebaseConfigStr) {
     }
 }
 
-/**
- * ─── Fetching Helper with Filtering ──────────────────────────────────────────
- * Uses the new API key from environment variables.
- */
-async function fetchFromStatPal(endpoint, params = {}) {
-    // PRIORITIZE your new key from Render environment variables
-    const statpalKey = process.env.STATPAL_API_KEY || '98e5c7b5-5b16-412c-a270-c3196e4ef98f';
-    
+// ─── API Fetchers ────────────────────────────────────────────────────────────
+
+// 1. StatPal
+async function fetchStatPal() {
+    const key = process.env.STATPAL_API_KEY || '98e5c7b5-5b16-412c-a270-c3196e4ef98f';
     try {
-        const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
-            params: { ...params, access_key: statpalKey },
-            timeout: 15000 
+        const r = await axios.get(`https://statpal.io/api/v1/soccer/livescores`, { params: { access_key: key }, timeout: 10000 });
+        const matches = [];
+        const leagues = Array.isArray(r.data?.livescore?.league) ? r.data.livescore.league : [r.data?.livescore?.league].filter(Boolean);
+        leagues.forEach(l => {
+            const ms = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
+            ms.forEach(m => matches.push({ id: m.id, home: m.home.name, away: m.away.name, league: l.name }));
         });
-        return r.data;
-    } catch (error) {
-        console.error(`❌ StatPal API Error [${endpoint}]:`, error.message);
-        return null;
-    }
+        return matches;
+    } catch (e) { return []; }
+}
+
+// 2. API-Football
+async function fetchApiFootball() {
+    const key = process.env.API_FOOTBALL_KEY;
+    if (!key) return [];
+    try {
+        const r = await axios.get('https://v3.football.api-sports.io/fixtures', {
+            params: { live: 'all' },
+            headers: { 'x-apisports-key': key },
+            timeout: 10000
+        });
+        return (r.data?.response || []).map(f => ({
+            id: String(f.fixture.id),
+            home: f.teams.home.name,
+            away: f.teams.away.name,
+            league: f.league.name
+        }));
+    } catch (e) { return []; }
+}
+
+// 3. Sportmonks
+async function fetchSportmonks() {
+    const key = process.env.SPORTMONKS_KEY;
+    if (!key) return [];
+    try {
+        const r = await axios.get('https://api.sportmonks.com/v3/football/livescores/inplay', {
+            params: { api_token: key, include: 'participants;league' },
+            timeout: 10000
+        });
+        return (r.data?.data || []).map(f => {
+            const home = f.participants?.find(p => p.meta?.location === 'home')?.name || 'Home';
+            const away = f.participants?.find(p => p.meta?.location === 'away')?.name || 'Away';
+            return { id: String(f.id), home, away, league: f.league?.name || 'Unknown' };
+        });
+    } catch (e) { return []; }
+}
+
+// 4. Football-Data.org
+async function fetchFootballData() {
+    const key = process.env.FOOTBALL_DATA_KEY;
+    if (!key) return [];
+    try {
+        const r = await axios.get('https://api.football-data.org/v4/matches', {
+            headers: { 'X-Auth-Token': key },
+            timeout: 10000
+        });
+        return (r.data?.matches || []).filter(m => m.status === 'IN_PLAY' || m.status === 'PAUSED').map(m => ({
+            id: String(m.id),
+            home: m.homeTeam.name,
+            away: m.awayTeam.name,
+            league: m.competition.name
+        }));
+    } catch (e) { return []; }
 }
 
 // ─── Telegram Bot Logic ──────────────────────────────────────────────────────
@@ -84,76 +114,50 @@ if (botToken) {
     ];
 
     const adminMenu = Markup.keyboard([
-        ['➕ Add New Prediction', '🔄 Sync Match Data']
+        ['➕ Add New Prediction', '🔄 Sync Global Data']
     ]).resize();
 
-    bot.start((ctx) => ctx.reply('⚽ *Magic Admin - Professional Edition*\nMajor leagues filtering is active. Your new API key is being used.', { parse_mode: 'Markdown', ...adminMenu }));
+    bot.start((ctx) => ctx.reply('⚽ *Magic Analysis Multi-Engine*\nSelect an API to see its live matches.', { parse_mode: 'Markdown', ...adminMenu }));
 
     bot.hears('➕ Add New Prediction', (ctx) => {
-        ctx.reply('Select match category:', Markup.inlineKeyboard([
-            [Markup.button.callback('🔴 Live Matches', 'cat_live')],
-            [Markup.button.callback('🔵 Upcoming Matches', 'cat_upcoming')],
-            [Markup.button.callback('✅ Past/Finished', 'cat_past')]
+        ctx.reply('Which data source would you like to use for Live matches?', Markup.inlineKeyboard([
+            [Markup.button.callback('🏆 Sportmonks', 'src_sm')],
+            [Markup.button.callback('⚽ API-Football', 'src_af')],
+            [Markup.button.callback('📊 Football-Data', 'src_fd')],
+            [Markup.button.callback('🎯 StatPal (Default)', 'src_sp')]
         ]));
     });
 
-    bot.action(/cat_(.+)/, async (ctx) => {
-        const category = ctx.match[1];
+    bot.action(/src_(.+)/, async (ctx) => {
+        const source = ctx.match[1];
         ctx.answerCbQuery();
-        ctx.reply(`⏳ Loading Major ${category} matches...`);
-        
-        let data;
-        if (category === 'upcoming') {
-            const tomorrow = new Date();
-            tomorrow.setDate(tomorrow.getDate() + 1);
-            const dateStr = tomorrow.toISOString().split('T')[0];
-            data = await fetchFromStatPal('fixtures', { date: dateStr });
-        } else {
-            data = await fetchFromStatPal('livescores');
-        }
+        ctx.reply(`⏳ Requesting data from ${source.toUpperCase()}...`);
 
-        if (!data || !data.livescore) return ctx.reply('❌ No data found. Verify your API key limits.');
+        let matches = [];
+        if (source === 'sm') matches = await fetchSportmonks();
+        else if (source === 'af') matches = await fetchApiFootball();
+        else if (source === 'fd') matches = await fetchFootballData();
+        else matches = await fetchStatPal();
 
-        const matches = [];
-        const leagues = Array.isArray(data.livescore.league) ? data.livescore.league : [data.livescore.league];
-        
-        leagues.forEach(l => {
-            // UNCOMMENT the line below if you want to STRICTLY only show the major leagues listed at the top
-            // if (!MAJOR_LEAGUES.includes(Number(l.id))) return;
+        if (matches.length === 0) return ctx.reply('❌ No live matches found in this source.');
 
-            const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
-            items.forEach(m => {
-                const status = m.status || '';
-                const isFin = ['FT', 'AET', 'PEN'].includes(status);
-                const isUpc = ['NS', 'TBD'].includes(status) || /^\d{2}:\d{2}$/.test(status);
-
-                if (category === 'live' && !isFin && !isUpc) matches.push({ ...m, leagueName: l.name });
-                else if (category === 'past' && isFin) matches.push({ ...m, leagueName: l.name });
-                else if (category === 'upcoming' && isUpc) matches.push({ ...m, leagueName: l.name });
-            });
-        });
-
-        if (matches.length === 0) return ctx.reply('❌ No major matches found in this category.');
-
-        const buttons = matches.slice(0, 15).map(m => [
-            Markup.button.callback(`${m.leagueName.substring(0,6)}: ${m.home.name} vs ${m.away.name}`, `select_${m.id}`)
+        // Show top 12 matches to avoid UI clutter
+        const buttons = matches.slice(0, 12).map(m => [
+            Markup.button.callback(`${m.league.substring(0,6)}: ${m.home} vs ${m.away}`, `sel_${m.id}`)
         ]);
-        ctx.reply('👉 Choose a match to provide a tip for:', Markup.inlineKeyboard(buttons));
+        ctx.reply(`👉 Select match from ${source.toUpperCase()}:`, Markup.inlineKeyboard(buttons));
     });
 
-    bot.action(/select_(.+)/, (ctx) => {
+    bot.action(/sel_(.+)/, (ctx) => {
         userSession[ctx.from.id] = { matchId: ctx.match[1], step: 'WAITING_FOR_TIP' };
         ctx.answerCbQuery();
-        ctx.reply('🎯 Select your expert prediction:', Markup.keyboard(PREDICTION_OPTIONS).resize());
+        ctx.reply('🎯 Set your professional tip:', Markup.keyboard(PREDICTION_OPTIONS).resize());
     });
 
     bot.on('text', async (ctx) => {
         const session = userSession[ctx.from.id];
         if (session?.step === 'WAITING_FOR_TIP') {
-            if (ctx.message.text === '❌ Cancel') { 
-                delete userSession[ctx.from.id]; 
-                return ctx.reply('Cancelled.', adminMenu); 
-            }
+            if (ctx.message.text === '❌ Cancel') { delete userSession[ctx.from.id]; return ctx.reply('Cancelled.', adminMenu); }
             try {
                 if (db) {
                     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions', 'current');
@@ -162,40 +166,28 @@ if (botToken) {
                     tips[session.matchId] = { tip: ctx.message.text, time: new Date().toISOString() };
                     await setDoc(docRef, { tips });
                     delete userSession[ctx.from.id];
-                    ctx.reply(`✅ TIP SAVED: ${ctx.message.text}\nYour prediction is now live on the website.`, adminMenu);
+                    ctx.reply(`✅ TIP LIVE: ${ctx.message.text}`, adminMenu);
                 }
-            } catch (e) { ctx.reply('❌ Database Error: ' + e.message); }
-        }
-    });
-
-    bot.hears('🔄 Sync Match Data', async (ctx) => {
-        ctx.reply('⏳ Syncing latest major scores to your database...');
-        const data = await fetchFromStatPal('livescores');
-        if (db && data) {
-            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), data);
-            ctx.reply('✅ Sync Successful! The website is now up to date.');
+            } catch (e) { ctx.reply('❌ Error: ' + e.message); }
         }
     });
 
     bot.launch();
 }
 
-// ─── API Endpoint for Frontend ───────────────────────────────────────────────
+// ─── Web API ─────────────────────────────────────────────────────────────────
 app.get('/api/scores', async (req, res) => {
     try {
         let scoresData = { livescore: { league: [] } };
         let manualTips = {};
-
         if (db) {
             const scoreSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
             if (scoreSnap.exists()) scoresData = scoreSnap.data();
             const tipSnap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'manual_predictions', 'current'));
             if (tipSnap.exists()) manualTips = tipSnap.data().tips || {};
         }
-
         const flat = [];
         const leagues = Array.isArray(scoresData.livescore?.league) ? scoresData.livescore.league : [scoresData.livescore?.league].filter(Boolean);
-        
         leagues.forEach(lg => {
             const ms = Array.isArray(lg.match) ? lg.match : [lg.match].filter(Boolean);
             ms.forEach(m => {
@@ -203,10 +195,9 @@ app.get('/api/scores', async (req, res) => {
                 flat.push({...m, leagueName: lg.name, country: lg.country});
             });
         });
-
         res.json({ matches: flat });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/', (req, res) => res.send('Magic Filtering API Online. Using Premium Key.'));
-app.listen(port, () => console.log(`Server running on ${port}`));
+app.get('/', (req, res) => res.send('Multi-Engine Backend Online.'));
+app.listen(port, () => console.log(`Server live on ${port}`));
