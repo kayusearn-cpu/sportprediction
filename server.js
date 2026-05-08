@@ -30,8 +30,10 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ─── Telegram Bot Logic ──────────────────────────────────────────────────────
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
+let bot = null;
+
 if (botToken) {
-    const bot = new Telegraf(botToken);
+    bot = new Telegraf(botToken);
     const userSession = {};
 
     const mainMenu = Markup.keyboard([
@@ -146,7 +148,11 @@ if (botToken) {
         } catch (e) { ctx.reply('❌ Save Error: ' + e.message); }
     }
 
-    bot.launch();
+    bot.launch().then(() => console.log('🤖 Bot launched.')).catch(e => console.error("Bot launch error:", e));
+
+    // Enable graceful stop
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
 }
 
 // ─── API Endpoint ────────────────────────────────────────────────────────────
