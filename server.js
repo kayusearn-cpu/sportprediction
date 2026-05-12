@@ -254,9 +254,31 @@ if (botToken) {
         }
     });
 
-    bot.launch();
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+    // ─── Conflict & Lifecycle Management ───
+    const launchBot = (retries = 5) => {
+        bot.launch().then(() => {
+            console.log('🤖 Bot launched successfully.');
+        }).catch(err => {
+            if (err.response && err.response.error_code === 409 && retries > 0) {
+                console.log(`⚠️ Bot conflict (409) detected. Another instance is still active. Retrying in 10s... (${retries} left)`);
+                setTimeout(() => launchBot(retries - 1), 10000);
+            } else {
+                console.error("❌ Bot launch failed permanently:", err.message);
+            }
+        });
+    };
+
+    launchBot();
+
+    // Enable graceful stop
+    const stopHandler = (signal) => {
+        console.log(`Received ${signal}. Shutting down bot...`);
+        bot.stop(signal);
+        process.exit(0);
+    };
+
+    process.once('SIGINT', () => stopHandler('SIGINT'));
+    process.once('SIGTERM', () => stopHandler('SIGTERM'));
 }
 
 // ─── API Endpoint: Fix "Undefined" Prediction ───
@@ -269,7 +291,6 @@ app.get('/api/get-predictions', async (req, res) => {
                 const matches = snap.data().matches || [];
                 const match = matches.find(m => m.id === fixtureId);
                 
-                // If match has a manual prediction, return it so details sheet isn't undefined
                 if (match && match.manual_prediction) {
                     return res.json({
                         response: [{
