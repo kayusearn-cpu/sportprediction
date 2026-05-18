@@ -38,7 +38,12 @@ if (firebaseConfigStr) {
 }
 
 // ─── OpenAI Initialization ───────────────────────────────────────────────────
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+let openai = null;
+if (process.env.OPENAI_API_KEY) {
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY.trim() });
+} else {
+    console.warn("⚠️ OPENAI_API_KEY is missing! Server will run, but Vision features will be disabled.");
+}
 
 // ─── Telegram Bot Logic ──────────────────────────────────────────────────────
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -128,18 +133,19 @@ if (botToken) {
         }
         if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') return publishMatches(ctx, false);
         if (session?.pendingMatches && ctx.message.text === '🧹 Wipe & Replace All') return publishMatches(ctx, true);
+        if (userSession[ctx.from.id]?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') {
+            return publishMatches(ctx);
+        }
     });
 
-    bot.hears('🧹 Replace All with Upcoming', (ctx) => {
-        if (!checkAdmin(ctx)) return;
-        ctx.reply('📸 Please upload a screenshot. I will DELETE all existing matches and replace them with these as "Upcoming".');
-        userSession[ctx.from.id] = { replaceAllMode: true };
-    });
-
+    // ── Vision Handling ──
     bot.on('photo', async (ctx) => {
         if (!checkAdmin(ctx)) return;
+        if (!openai) return ctx.reply('❌ OpenAI API Key is missing on the server! Please add OPENAI_API_KEY to your Railway Variables.');
+        
         const photo = ctx.message.photo[ctx.message.photo.length - 1]; 
-        ctx.reply('⏳ Analyzing screenshot details...');
+        ctx.reply('⏳ Reading screenshot... Teams, Scores, Predictions, Dates, and Times are being extracted.');
+
         try {
             const fileLink = await ctx.telegram.getFileLink(photo.file_id);
             const imageResponse = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
