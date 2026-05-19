@@ -62,6 +62,71 @@ async function fetchFromStatPal(endpoint, params = {}) {
     }
 }
 
+// ─── Auto-Live Sync Logic ────────────────────────────────────────────────────
+let autoLiveInterval = null;
+let isAutoLiveOn = false;
+
+async function syncLiveScores() {
+    if (!db) return;
+    try {
+        const data = await fetchFromStatPal('livescores');
+        if (!data || !data.livescore || !data.livescore.league) return;
+
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
+        const snap = await getDoc(docRef);
+        if (!snap.exists()) return;
+        
+        let currentData = snap.data();
+        let updated = false;
+
+        const leagues = Array.isArray(data.livescore.league) ? data.livescore.league : [data.livescore.league];
+        
+        leagues.forEach(l => {
+            const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
+            items.forEach(m => {
+                // Find existing match by ID or exact Team Names
+                const idx = currentData.matches.findIndex(em => 
+                    (em.id === `api_${m.id}`) || 
+                    (em.home.name.toLowerCase() === m.home.name.toLowerCase() && em.away.name.toLowerCase() === m.away.name.toLowerCase())
+                );
+
+                if (idx !== -1) {
+                    const statusText = m.status || '';
+                    let hGoal = null, aGoal = null;
+                    if (m.score && m.score.includes('-')) {
+                        hGoal = m.score.split('-')[0].trim();
+                        aGoal = m.score.split('-')[1].trim();
+                    } else if (m.home?.goals !== undefined) {
+                        hGoal = m.home.goals;
+                        aGoal = m.away.goals;
+                    }
+
+                    // Only update scores and time, preserve predictions
+                    currentData.matches[idx].home.goals = hGoal;
+                    currentData.matches[idx].away.goals = aGoal;
+                    
+                    if (['FT', 'AET', 'PEN'].includes(statusText)) {
+                        currentData.matches[idx].status = 'Past';
+                        currentData.matches[idx].playing_time = 'FT';
+                    } else {
+                        currentData.matches[idx].status = 'Live';
+                        currentData.matches[idx].playing_time = statusText; // This applies the live minute e.g. 75'
+                    }
+                    updated = true;
+                }
+            });
+        });
+
+        if (updated) {
+            await setDoc(docRef, currentData);
+            console.log("⏱️ Auto-Live Sync updated live scores on the site.");
+        }
+    } catch(e) {
+        console.error("Auto-Live Sync Error:", e.message);
+    }
+}
+
+
 // ─── Telegram Bot Logic ──────────────────────────────────────────────────────
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
 let bot = null;
@@ -70,9 +135,10 @@ if (botToken) {
     bot = new Telegraf(botToken);
     const userSession = {};
 
-    const mainMenu = Markup.keyboard([
+    const getMainMenu = () => Markup.keyboard([
         ['🔴 Live', '✅ Past Results', '🔵 Upcoming'],
         ['🔄 Sync API: Today', '🔄 Sync API: Tomorrow'],
+        [`⏱️ Auto-Live Sync: ${isAutoLiveOn ? 'ON' : 'OFF'}`],
         ['📸 Upload Screenshot', '🧹 Replace All with Upcoming'],
         ['🗑️ Clear All Matches']
     ]).resize();
@@ -81,10 +147,25 @@ if (botToken) {
 
     bot.start((ctx) => {
         if (!checkAdmin(ctx)) return;
-        ctx.reply('⚽ *Magic AI Dashboard*\n\nManage your site categories, sync real-time API data, or upload a screenshot.', {
+        ctx.reply('⚽ *Magic AI Dashboard*\n\nTurn on **Auto-Live Sync** to automatically refresh match minutes and scores in real-time!', {
             parse_mode: 'Markdown',
-            ...mainMenu
+            ...getMainMenu()
         });
+    });
+
+    // ─── Auto-Live Sync Toggle ───
+    bot.hears(/⏱️ Auto-Live Sync: (OFF|ON)/, (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        isAutoLiveOn = !isAutoLiveOn;
+        
+        if (isAutoLiveOn) {
+            ctx.reply("🚀 *Real-Time Live Sync Started!*\nI will check StatPal every 60 seconds and automatically update the match minutes and live scores for any games currently in progress on your website.", { parse_mode: 'Markdown', ...getMainMenu() });
+            syncLiveScores(); // Run immediately
+            autoLiveInterval = setInterval(syncLiveScores, 60000); // Run every 1 minute
+        } else {
+            ctx.reply("🛑 *Real-Time Live Sync Stopped.*", { parse_mode: 'Markdown', ...getMainMenu() });
+            if (autoLiveInterval) clearInterval(autoLiveInterval);
+        }
     });
 
     const showCategory = async (ctx, statusFilter) => {
@@ -229,6 +310,10 @@ if (botToken) {
             
             await setDoc(docRef, { matches: currentData.matches.slice(0, 60) });
             ctx.reply(`✅ Successfully synced ${matchesToSave.length} matches for ${day}!\n\nMatches were automatically sorted into Live, Upcoming, and Past.`);
+            
+            // If Auto-live is on, trigger an immediate live sync after fetching fixtures
+            if (isAutoLiveOn) syncLiveScores();
+
         } catch(e) {
             ctx.reply('❌ API Error: ' + e.message);
         }
@@ -246,7 +331,7 @@ if (botToken) {
         if (!openai) return ctx.reply('❌ OpenAI API Key is missing on the server! Please add OPENAI_API_KEY to your Railway Variables.');
         
         const photo = ctx.message.photo[ctx.message.photo.length - 1]; 
-        ctx.reply('⏳ Reading screenshot... Teams, Scores, Predictions, Dates, and Times are being extracted.');
+        ctx.reply('⏳ Reading screenshot... Extracting Teams, Dates, Times, Predictions, Scores, and Probabilities!');
 
         try {
             const fileLink = await ctx.telegram.getFileLink(photo.file_id);
@@ -254,8 +339,11 @@ if (botToken) {
             const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
             const completion = await openai.chat.completions.create({
                 model: "gpt-4o-mini",
-                messages: [{ role: "system", content: "Extract football JSON: matches[{home, away, prediction, pScore, liveScore, min, date, time, lg}]. Detect dates and times clearly." }, 
-                { role: "user", content: [{ type: "text", text: "Scan:" }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }] }],
+                messages: [{ 
+                    role: "system", 
+                    content: "You are an expert football data scraper. Extract EVERY match shown in the image exactly as it appears. Return a JSON object with a 'matches' array. For each match, extract: 'home' (Home team), 'away' (Away team), 'date' (e.g. 19/05/2026), 'time' (e.g. 19:30), 'prediction' (1, X, or 2), 'pScore' (Correct score prediction e.g. 1-3), 'liveScore' (Live or final score), 'min' (FT, HT, or minute), 'lg' (League initials), 'probHome' (Home win prob %), 'probDraw' (Draw prob %), and 'probAway' (Away win prob %). Do not miss the time and date!" 
+                }, 
+                { role: "user", content: [{ type: "text", text: "Scan this screenshot and extract all match details:" }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }] }],
                 response_format: { type: "json_object" }
             });
             const matches = JSON.parse(completion.choices[0].message.content).matches || [];
@@ -263,11 +351,15 @@ if (botToken) {
             userSession[ctx.from.id] = { pendingMatches: matches, replaceAllMode: isReplace };
 
             let summary = `🔍 Detected ${matches.length} matches:\n\n`;
-            matches.forEach((m, i) => summary += `${i+1}. *${m.home} vs ${m.away}*\n🎯 Tip: ${m.prediction || m.pred}\n\n`);
+            matches.forEach((m, i) => {
+                const dt = m.date ? `[${m.date} ${m.time || ''}]` : "";
+                const probs = m.probHome ? `(Prob: ${m.probHome}% | ${m.probDraw}% | ${m.probAway}%)` : "";
+                summary += `${i+1}. *${m.home} vs ${m.away}* ${dt}\n🎯 Tip: ${m.prediction || m.pred} | Score: ${m.pScore || ''} \n📊 ${probs}\n\n`;
+            });
 
             const btns = isReplace ? [['🧹 Wipe & Replace All'], ['❌ Cancel']] : [['🚀 Confirm & Publish'], ['❌ Cancel']];
             ctx.reply(summary, { parse_mode: 'Markdown', ...Markup.keyboard(btns).resize() });
-        } catch (e) { ctx.reply('Vision Scan Error.'); }
+        } catch (e) { ctx.reply('Vision Scan Error: ' + e.message); }
     });
 
     async function publishMatches(ctx, wipeFirst) {
@@ -292,17 +384,22 @@ if (botToken) {
                     status: status,
                     playing_time: wipeFirst ? "" : (m.min || ""),
                     manual_prediction: `${m.prediction || m.pred} (${m.pScore || ''})`,
+                    probabilities: {
+                        home: m.probHome || null,
+                        draw: m.probDraw || null,
+                        away: m.probAway || null
+                    },
                     country: "Pro Tip"
                 };
                 currentData.matches.unshift(matchObj);
             });
             await setDoc(docRef, { matches: currentData.matches.slice(0, 50) });
             delete userSession[ctx.from.id];
-            ctx.reply('✅ Success! Website updated.', mainMenu);
+            ctx.reply('✅ Success! Website updated.', getMainMenu());
         } catch (e) { ctx.reply('Save Error.'); }
     }
 
-    bot.hears('❌ Cancel', (ctx) => { delete userSession[ctx.from.id]; ctx.reply('Cancelled.', mainMenu); });
+    bot.hears('❌ Cancel', (ctx) => { delete userSession[ctx.from.id]; ctx.reply('Cancelled.', getMainMenu()); });
     bot.hears('🗑️ Clear All Matches', async (ctx) => { if (checkAdmin(ctx)) await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), { matches: [] }); ctx.reply('Cleared.'); });
 
     const launchBot = (retries = 5) => {
@@ -318,7 +415,7 @@ app.get('/api/get-predictions', async (req, res) => {
         if (snap.exists()) {
             const match = (snap.data().matches || []).find(m => m.id === fixtureId);
             if (match && match.manual_prediction) {
-                return res.json({ response: [{ predictions: { percent: { home: "—", draw: "—", away: "—" }, advice: match.manual_prediction, code: match.manual_prediction.charAt(0) } }] });
+                return res.json({ response: [{ predictions: { percent: { home: match.probabilities?.home ? match.probabilities.home + "%" : "—", draw: match.probabilities?.draw ? match.probabilities.draw + "%" : "—", away: match.probabilities?.away ? match.probabilities.away + "%" : "—" }, advice: match.manual_prediction, code: match.manual_prediction.charAt(0) } }] });
             }
         }
         res.json({ response: [] });
