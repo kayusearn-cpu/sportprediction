@@ -45,6 +45,23 @@ if (process.env.OPENAI_API_KEY) {
     console.warn("⚠️ OPENAI_API_KEY is missing! Server will run, but Vision features will be disabled.");
 }
 
+// ─── StatPal API Integration ─────────────────────────────────────────────────
+const STATPAL_KEY = process.env.STATPAL_API_KEY || 'bcd42a3c-46ce-4dd2-aaae-320cf9d98f22';
+const MAJOR_LEAGUES = [8, 301, 384, 82, 564, 2, 3, 4, 693, 400, 462, 556, 1, 30]; // Filter for top leagues
+
+async function fetchFromStatPal(endpoint, params = {}) {
+    try {
+        const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
+            params: { ...params, access_key: STATPAL_KEY },
+            timeout: 15000 
+        });
+        return r.data;
+    } catch (error) {
+        console.error(`❌ StatPal Error [${endpoint}]:`, error.message);
+        return null;
+    }
+}
+
 // ─── Telegram Bot Logic ──────────────────────────────────────────────────────
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
 let bot = null;
@@ -55,6 +72,7 @@ if (botToken) {
 
     const mainMenu = Markup.keyboard([
         ['🔴 Live', '✅ Past Results', '🔵 Upcoming'],
+        ['🔄 Sync API: Today', '🔄 Sync API: Tomorrow'],
         ['📸 Upload Screenshot', '🧹 Replace All with Upcoming'],
         ['🗑️ Clear All Matches']
     ]).resize();
@@ -63,7 +81,7 @@ if (botToken) {
 
     bot.start((ctx) => {
         if (!checkAdmin(ctx)) return;
-        ctx.reply('⚽ *Magic AI Dashboard*\n\nManage your site categories or upload a screenshot. Use "Replace All" to clean your site and set new matches as Upcoming.', {
+        ctx.reply('⚽ *Magic AI Dashboard*\n\nManage your site categories, sync real-time API data, or upload a screenshot.', {
             parse_mode: 'Markdown',
             ...mainMenu
         });
@@ -133,9 +151,93 @@ if (botToken) {
         }
         if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') return publishMatches(ctx, false);
         if (session?.pendingMatches && ctx.message.text === '🧹 Wipe & Replace All') return publishMatches(ctx, true);
-        if (userSession[ctx.from.id]?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') {
-            return publishMatches(ctx);
+    });
+
+    // ─── StatPal API Fetching Logic ───
+    bot.hears(/🔄 Sync API: (Today|Tomorrow)/, async (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        const day = ctx.match[1];
+        ctx.reply(`⏳ Fetching ${day}'s major matches from StatPal...`);
+        
+        const targetDate = new Date();
+        if (day === 'Tomorrow') targetDate.setDate(targetDate.getDate() + 1);
+        const dateStr = targetDate.toISOString().split('T')[0];
+
+        try {
+            const data = await fetchFromStatPal('fixtures', { date: dateStr });
+            if (!data) return ctx.reply('❌ Failed to fetch from API. Check key limits.');
+            
+            const matchesToSave = [];
+            const leagues = data.livescore?.league || (Array.isArray(data.data) ? [{match: data.data}] : []);
+            
+            leagues.forEach(l => {
+                // Filter for major leagues only to avoid fake/obscure matches
+                if (l.id && !MAJOR_LEAGUES.includes(Number(l.id))) return;
+
+                const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
+                items.forEach(m => {
+                    const statusText = m.status || '';
+                    const isFin = ['FT', 'AET', 'PEN'].includes(statusText);
+                    const isUpc = ['NS', 'TBD', 'POSTP'].includes(statusText) || /^\d{2}:\d{2}$/.test(statusText);
+                    
+                    // Smart Categorization: Sorts today's games into proper buckets
+                    let computedStatus = "Upcoming";
+                    if (isFin) computedStatus = "Past";
+                    else if (!isUpc) computedStatus = "Live";
+
+                    // Safely extract scores
+                    let hGoal = null, aGoal = null;
+                    if (m.score && m.score.includes('-')) {
+                        hGoal = m.score.split('-')[0].trim();
+                        aGoal = m.score.split('-')[1].trim();
+                    } else if (m.home?.goals !== undefined) {
+                        hGoal = m.home.goals;
+                        aGoal = m.away.goals;
+                    }
+
+                    matchesToSave.push({
+                        id: `api_${m.id || Date.now()}`,
+                        date: dateStr,
+                        time: m.time || (isUpc ? statusText : ""),
+                        home: { name: m.home?.name || 'Home', goals: hGoal },
+                        away: { name: m.away?.name || 'Away', goals: aGoal },
+                        leagueName: l.name || "Major League",
+                        status: computedStatus,
+                        playing_time: computedStatus === "Live" ? statusText : (isFin ? "FT" : ""),
+                        manual_prediction: "", 
+                        country: "API Data"
+                    });
+                });
+            });
+
+            if (matchesToSave.length === 0) return ctx.reply(`❌ No major matches found for ${day}.`);
+
+            // Merge with existing matches in the DB to preserve manual predictions
+            const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
+            const snap = await getDoc(docRef);
+            let currentData = snap.exists() ? snap.data() : { matches: [] };
+
+            matchesToSave.forEach(newM => {
+                const idx = currentData.matches.findIndex(em => em.home.name === newM.home.name && em.away.name === newM.away.name);
+                if (idx !== -1) {
+                    newM.manual_prediction = currentData.matches[idx].manual_prediction || "";
+                    currentData.matches[idx] = newM; // Update existing
+                } else {
+                    currentData.matches.unshift(newM); // Add new
+                }
+            });
+            
+            await setDoc(docRef, { matches: currentData.matches.slice(0, 60) });
+            ctx.reply(`✅ Successfully synced ${matchesToSave.length} matches for ${day}!\n\nMatches were automatically sorted into Live, Upcoming, and Past.`);
+        } catch(e) {
+            ctx.reply('❌ API Error: ' + e.message);
         }
+    });
+
+    bot.hears('🧹 Replace All with Upcoming', (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        ctx.reply('📸 Please upload a screenshot. I will DELETE all existing matches and replace them with these as "Upcoming".');
+        userSession[ctx.from.id] = { replaceAllMode: true };
     });
 
     // ── Vision Handling ──
