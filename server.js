@@ -6,6 +6,7 @@ const { Telegraf, Markup } = require('telegraf');
 const { OpenAI } = require('openai');
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, setDoc, getDoc } = require('firebase/firestore');
+const { getAuth, signInAnonymously } = require('firebase/auth');
 
 const app = express();
 const port = process.env.PORT || 10000; 
@@ -26,15 +27,22 @@ const checkAdmin = (ctx) => {
     return false;
 };
 
-// ─── Firebase Initialization ─────────────────────────────────────────────────
+// ─── Firebase Initialization (WITH AUTHENTICATION) ───────────────────────────
 const firebaseConfigStr = process.env.FIREBASE_CONFIG;
 let db = null;
 if (firebaseConfigStr) {
     try {
         const firebaseApp = initializeApp(JSON.parse(firebaseConfigStr.trim()));
         db = getFirestore(firebaseApp);
-        console.log("🔥 Firebase connected.");
-    } catch (err) { console.error("❌ Firebase Error:", err.message); }
+        const auth = getAuth(firebaseApp);
+        
+        // Authenticate the server so Firebase Security Rules don't block saves
+        signInAnonymously(auth)
+            .then(() => console.log("🔥 Firebase Authenticated Successfully."))
+            .catch(err => console.error("❌ Firebase Auth Error:", err.message));
+            
+        console.log("🔥 Firebase Database connected.");
+    } catch (err) { console.error("❌ Firebase Config Error:", err.message); }
 }
 
 // ─── OpenAI Initialization ───────────────────────────────────────────────────
@@ -84,7 +92,6 @@ async function syncLiveScores() {
         leagues.forEach(l => {
             const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
             items.forEach(m => {
-                // Find existing match by ID or exact Team Names
                 const idx = currentData.matches.findIndex(em => 
                     (em.id === `api_${m.id}`) || 
                     (em.home.name.toLowerCase() === m.home.name.toLowerCase() && em.away.name.toLowerCase() === m.away.name.toLowerCase())
@@ -101,7 +108,6 @@ async function syncLiveScores() {
                         aGoal = m.away.goals;
                     }
 
-                    // Only update scores and time, preserve predictions
                     currentData.matches[idx].home.goals = hGoal;
                     currentData.matches[idx].away.goals = aGoal;
                     
@@ -110,7 +116,7 @@ async function syncLiveScores() {
                         currentData.matches[idx].playing_time = 'FT';
                     } else {
                         currentData.matches[idx].status = 'Live';
-                        currentData.matches[idx].playing_time = statusText; // This applies the live minute e.g. 75'
+                        currentData.matches[idx].playing_time = statusText; 
                     }
                     updated = true;
                 }
@@ -118,7 +124,9 @@ async function syncLiveScores() {
         });
 
         if (updated) {
-            await setDoc(docRef, currentData);
+            // JSON stringify/parse completely removes any hidden 'undefined' fields
+            const cleanData = JSON.parse(JSON.stringify(currentData));
+            await setDoc(docRef, cleanData);
             console.log("⏱️ Auto-Live Sync updated live scores on the site.");
         }
     } catch(e) {
@@ -153,15 +161,14 @@ if (botToken) {
         });
     });
 
-    // ─── Auto-Live Sync Toggle ───
     bot.hears(/⏱️ Auto-Live Sync: (OFF|ON)/, (ctx) => {
         if (!checkAdmin(ctx)) return;
         isAutoLiveOn = !isAutoLiveOn;
         
         if (isAutoLiveOn) {
-            ctx.reply("🚀 *Real-Time Live Sync Started!*\nI will check StatPal every 60 seconds and automatically update the match minutes and live scores for any games currently in progress on your website.", { parse_mode: 'Markdown', ...getMainMenu() });
-            syncLiveScores(); // Run immediately
-            autoLiveInterval = setInterval(syncLiveScores, 60000); // Run every 1 minute
+            ctx.reply("🚀 *Real-Time Live Sync Started!*\nI will check StatPal every 60 seconds.", { parse_mode: 'Markdown', ...getMainMenu() });
+            syncLiveScores(); 
+            autoLiveInterval = setInterval(syncLiveScores, 60000); 
         } else {
             ctx.reply("🛑 *Real-Time Live Sync Stopped.*", { parse_mode: 'Markdown', ...getMainMenu() });
             if (autoLiveInterval) clearInterval(autoLiveInterval);
@@ -170,6 +177,8 @@ if (botToken) {
 
     const showCategory = async (ctx, statusFilter) => {
         if (!checkAdmin(ctx)) return;
+        if (!db) return ctx.reply('❌ Database not connected. Check FIREBASE_CONFIG in Railway.');
+        
         const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
         const matches = (snap.exists() ? snap.data().matches : []).filter(m => m.status === statusFilter);
         if (matches.length === 0) return ctx.reply(`No ${statusFilter} matches.`);
@@ -203,6 +212,8 @@ if (botToken) {
         const session = userSession[ctx.from.id];
         if (session && session.editing) {
             const val = ctx.message.text;
+            if (!db) return ctx.reply('❌ Database not connected.');
+
             try {
                 const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
                 const snap = await getDoc(docRef);
@@ -223,7 +234,9 @@ if (botToken) {
                         data.matches[idx].date = val.split(' ')[0];
                         data.matches[idx].time = val.split(' ')[1] || "";
                     }
-                    await setDoc(docRef, data);
+                    
+                    const cleanData = JSON.parse(JSON.stringify(data)); // Sanitize
+                    await setDoc(docRef, cleanData);
                     ctx.reply('✅ Site Updated!');
                 }
                 delete userSession[ctx.from.id];
@@ -234,9 +247,10 @@ if (botToken) {
         if (session?.pendingMatches && ctx.message.text === '🧹 Wipe & Replace All') return publishMatches(ctx, true);
     });
 
-    // ─── StatPal API Fetching Logic ───
     bot.hears(/🔄 Sync API: (Today|Tomorrow)/, async (ctx) => {
         if (!checkAdmin(ctx)) return;
+        if (!db) return ctx.reply('❌ Database not connected. Check FIREBASE_CONFIG.');
+
         const day = ctx.match[1];
         ctx.reply(`⏳ Fetching ${day}'s major matches from StatPal...`);
         
@@ -252,7 +266,6 @@ if (botToken) {
             const leagues = data.livescore?.league || (Array.isArray(data.data) ? [{match: data.data}] : []);
             
             leagues.forEach(l => {
-                // Filter for major leagues only to avoid fake/obscure matches
                 if (l.id && !MAJOR_LEAGUES.includes(Number(l.id))) return;
 
                 const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
@@ -261,12 +274,10 @@ if (botToken) {
                     const isFin = ['FT', 'AET', 'PEN'].includes(statusText);
                     const isUpc = ['NS', 'TBD', 'POSTP'].includes(statusText) || /^\d{2}:\d{2}$/.test(statusText);
                     
-                    // Smart Categorization: Sorts today's games into proper buckets
                     let computedStatus = "Upcoming";
                     if (isFin) computedStatus = "Past";
                     else if (!isUpc) computedStatus = "Live";
 
-                    // Safely extract scores
                     let hGoal = null, aGoal = null;
                     if (m.score && m.score.includes('-')) {
                         hGoal = m.score.split('-')[0].trim();
@@ -293,7 +304,6 @@ if (botToken) {
 
             if (matchesToSave.length === 0) return ctx.reply(`❌ No major matches found for ${day}.`);
 
-            // Merge with existing matches in the DB to preserve manual predictions
             const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
             const snap = await getDoc(docRef);
             let currentData = snap.exists() ? snap.data() : { matches: [] };
@@ -302,16 +312,16 @@ if (botToken) {
                 const idx = currentData.matches.findIndex(em => em.home.name === newM.home.name && em.away.name === newM.away.name);
                 if (idx !== -1) {
                     newM.manual_prediction = currentData.matches[idx].manual_prediction || "";
-                    currentData.matches[idx] = newM; // Update existing
+                    currentData.matches[idx] = newM; 
                 } else {
-                    currentData.matches.unshift(newM); // Add new
+                    currentData.matches.unshift(newM);
                 }
             });
             
-            await setDoc(docRef, { matches: currentData.matches.slice(0, 60) });
+            const cleanData = JSON.parse(JSON.stringify({ matches: currentData.matches.slice(0, 60) }));
+            await setDoc(docRef, cleanData);
             ctx.reply(`✅ Successfully synced ${matchesToSave.length} matches for ${day}!\n\nMatches were automatically sorted into Live, Upcoming, and Past.`);
             
-            // If Auto-live is on, trigger an immediate live sync after fetching fixtures
             if (isAutoLiveOn) syncLiveScores();
 
         } catch(e) {
@@ -347,6 +357,8 @@ if (botToken) {
                 response_format: { type: "json_object" }
             });
             const matches = JSON.parse(completion.choices[0].message.content).matches || [];
+            if (matches.length === 0) return ctx.reply("❌ No matches detected. Try a clearer image.");
+            
             const isReplace = userSession[ctx.from.id]?.replaceAllMode || false;
             userSession[ctx.from.id] = { pendingMatches: matches, replaceAllMode: isReplace };
 
@@ -364,6 +376,9 @@ if (botToken) {
 
     async function publishMatches(ctx, wipeFirst) {
         const session = userSession[ctx.from.id];
+        if (!session || !session.pendingMatches) return ctx.reply("❌ Session expired. Please upload again.");
+        if (!db) return ctx.reply('❌ Database not connected. Check FIREBASE_CONFIG in Railway.');
+
         try {
             const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
             let currentData = { matches: [] };
@@ -375,7 +390,6 @@ if (botToken) {
             session.pendingMatches.forEach(m => {
                 let status = wipeFirst ? "Upcoming" : (m.min === 'FT' ? "Past" : (m.min || m.liveScore ? "Live" : "Upcoming"));
                 
-                // Extremely safe score extraction to prevent crash
                 let hGoal = null;
                 let aGoal = null;
                 if (!wipeFirst && m.liveScore) {
@@ -404,7 +418,11 @@ if (botToken) {
                 };
                 currentData.matches.unshift(matchObj);
             });
-            await setDoc(docRef, { matches: currentData.matches.slice(0, 50) });
+            
+            // JSON stringify/parse ensures ZERO 'undefined' values exist before saving
+            const cleanData = JSON.parse(JSON.stringify({ matches: currentData.matches.slice(0, 60) }));
+            await setDoc(docRef, cleanData);
+            
             delete userSession[ctx.from.id];
             ctx.reply('✅ Success! Website updated.', getMainMenu());
         } catch (e) { 
