@@ -227,7 +227,7 @@ if (botToken) {
                     ctx.reply('✅ Site Updated!');
                 }
                 delete userSession[ctx.from.id];
-            } catch (e) { ctx.reply('Save error.'); }
+            } catch (e) { ctx.reply(`❌ Save error: ${e.message}`); }
             return;
         }
         if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') return publishMatches(ctx, false);
@@ -315,7 +315,7 @@ if (botToken) {
             if (isAutoLiveOn) syncLiveScores();
 
         } catch(e) {
-            ctx.reply('❌ API Error: ' + e.message);
+            ctx.reply(`❌ API Error: ${e.message}`);
         }
     });
 
@@ -359,7 +359,7 @@ if (botToken) {
 
             const btns = isReplace ? [['🧹 Wipe & Replace All'], ['❌ Cancel']] : [['🚀 Confirm & Publish'], ['❌ Cancel']];
             ctx.reply(summary, { parse_mode: 'Markdown', ...Markup.keyboard(btns).resize() });
-        } catch (e) { ctx.reply('Vision Scan Error: ' + e.message); }
+        } catch (e) { ctx.reply(`❌ Vision Scan Error: ${e.message}`); }
     });
 
     async function publishMatches(ctx, wipeFirst) {
@@ -374,16 +374,27 @@ if (botToken) {
 
             session.pendingMatches.forEach(m => {
                 let status = wipeFirst ? "Upcoming" : (m.min === 'FT' ? "Past" : (m.min || m.liveScore ? "Live" : "Upcoming"));
+                
+                // Extremely safe score extraction to prevent crash
+                let hGoal = null;
+                let aGoal = null;
+                if (!wipeFirst && m.liveScore) {
+                    const scoreStr = String(m.liveScore).replace(':', '-');
+                    const parts = scoreStr.split('-');
+                    hGoal = parts[0] ? parts[0].trim() : null;
+                    aGoal = parts[1] ? parts[1].trim() : null;
+                }
+
                 const matchObj = {
                     id: `v_${Date.now()}_${Math.random().toString(36).substr(2, 2)}`,
                     date: m.date || new Date().toLocaleDateString('en-GB'),
                     time: m.time || "",
-                    home: { name: m.home, goals: wipeFirst ? null : (m.liveScore ? m.liveScore.split('-')[0].trim() : null) },
-                    away: { name: m.away, goals: wipeFirst ? null : (m.liveScore ? m.liveScore.split('-')[1].trim() : null) },
+                    home: { name: m.home || 'Unknown', goals: hGoal },
+                    away: { name: m.away || 'Unknown', goals: aGoal },
                     leagueName: m.lg || "Pro League",
                     status: status,
                     playing_time: wipeFirst ? "" : (m.min || ""),
-                    manual_prediction: `${m.prediction || m.pred} (${m.pScore || ''})`,
+                    manual_prediction: `${m.prediction || m.pred || ''} (${m.pScore || ''})`.trim(),
                     probabilities: {
                         home: m.probHome || null,
                         draw: m.probDraw || null,
@@ -396,7 +407,10 @@ if (botToken) {
             await setDoc(docRef, { matches: currentData.matches.slice(0, 50) });
             delete userSession[ctx.from.id];
             ctx.reply('✅ Success! Website updated.', getMainMenu());
-        } catch (e) { ctx.reply('Save Error.'); }
+        } catch (e) { 
+            console.error("Save Error Details:", e);
+            ctx.reply(`❌ Save Error: ${e.message}`, getMainMenu()); 
+        }
     }
 
     bot.hears('❌ Cancel', (ctx) => { delete userSession[ctx.from.id]; ctx.reply('Cancelled.', getMainMenu()); });
