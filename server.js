@@ -36,7 +36,6 @@ if (firebaseConfigStr) {
         db = getFirestore(firebaseApp);
         const auth = getAuth(firebaseApp);
         
-        // Authenticate the server so Firebase Security Rules don't block saves
         signInAnonymously(auth)
             .then(() => console.log("🔥 Firebase Authenticated Successfully."))
             .catch(err => console.error("❌ Firebase Auth Error:", err.message));
@@ -55,7 +54,7 @@ if (process.env.OPENAI_API_KEY) {
 
 // ─── StatPal API Integration ─────────────────────────────────────────────────
 const STATPAL_KEY = process.env.STATPAL_API_KEY || 'bcd42a3c-46ce-4dd2-aaae-320cf9d98f22';
-const MAJOR_LEAGUES = [8, 301, 384, 82, 564, 2, 3, 4, 693, 400, 462, 556, 1, 30]; // Filter for top leagues
+const MAJOR_LEAGUES = [8, 301, 384, 82, 564, 2, 3, 4, 693, 400, 462, 556, 1, 30];
 
 async function fetchFromStatPal(endpoint, params = {}) {
     try {
@@ -111,9 +110,15 @@ async function syncLiveScores() {
                     currentData.matches[idx].home.goals = hGoal;
                     currentData.matches[idx].away.goals = aGoal;
                     
-                    if (['FT', 'AET', 'PEN'].includes(statusText)) {
+                    const isFin = ['FT', 'AET', 'PEN', 'Finished'].includes(statusText);
+                    const isUpc = ['NS', 'TBD', 'POSTP'].includes(statusText) || /^\d{2}:\d{2}$/.test(statusText);
+
+                    if (isFin) {
                         currentData.matches[idx].status = 'Past';
                         currentData.matches[idx].playing_time = 'FT';
+                    } else if (isUpc) {
+                        currentData.matches[idx].status = 'Upcoming';
+                        currentData.matches[idx].playing_time = statusText;
                     } else {
                         currentData.matches[idx].status = 'Live';
                         currentData.matches[idx].playing_time = statusText; 
@@ -124,7 +129,6 @@ async function syncLiveScores() {
         });
 
         if (updated) {
-            // JSON stringify/parse completely removes any hidden 'undefined' fields
             const cleanData = JSON.parse(JSON.stringify(currentData));
             await setDoc(docRef, cleanData);
             console.log("⏱️ Auto-Live Sync updated live scores on the site.");
@@ -177,7 +181,7 @@ if (botToken) {
 
     const showCategory = async (ctx, statusFilter) => {
         if (!checkAdmin(ctx)) return;
-        if (!db) return ctx.reply('❌ Database not connected. Check FIREBASE_CONFIG in Railway.');
+        if (!db) return ctx.reply('❌ Database not connected.');
         
         const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
         const matches = (snap.exists() ? snap.data().matches : []).filter(m => m.status === statusFilter);
@@ -208,48 +212,9 @@ if (botToken) {
         ctx.reply(p[ctx.match[1]]);
     });
 
-    bot.on('text', async (ctx) => {
-        const session = userSession[ctx.from.id];
-        if (session && session.editing) {
-            const val = ctx.message.text;
-            if (!db) return ctx.reply('❌ Database not connected.');
-
-            try {
-                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
-                const snap = await getDoc(docRef);
-                let data = snap.data();
-                const idx = data.matches.findIndex(m => m.id === session.matchId);
-                if (idx !== -1) {
-                    if (session.editing === 'score') {
-                        const s = val.split('-');
-                        data.matches[idx].home.goals = s[0]?.trim();
-                        data.matches[idx].away.goals = s[1]?.trim();
-                    } else if (session.editing === 'pred') {
-                        data.matches[idx].manual_prediction = val;
-                    } else if (session.editing === 'min') {
-                        data.matches[idx].playing_time = val;
-                        if (val === 'FT') data.matches[idx].status = 'Past';
-                        else if (!isNaN(parseInt(val)) || val === 'HT') data.matches[idx].status = 'Live';
-                    } else if (session.editing === 'dt') {
-                        data.matches[idx].date = val.split(' ')[0];
-                        data.matches[idx].time = val.split(' ')[1] || "";
-                    }
-                    
-                    const cleanData = JSON.parse(JSON.stringify(data)); // Sanitize
-                    await setDoc(docRef, cleanData);
-                    ctx.reply('✅ Site Updated!');
-                }
-                delete userSession[ctx.from.id];
-            } catch (e) { ctx.reply(`❌ Save error: ${e.message}`); }
-            return;
-        }
-        if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') return publishMatches(ctx, false);
-        if (session?.pendingMatches && ctx.message.text === '🧹 Wipe & Replace All') return publishMatches(ctx, true);
-    });
-
     bot.hears(/🔄 Sync API: (Today|Tomorrow)/, async (ctx) => {
         if (!checkAdmin(ctx)) return;
-        if (!db) return ctx.reply('❌ Database not connected. Check FIREBASE_CONFIG.');
+        if (!db) return ctx.reply('❌ Database not connected.');
 
         const day = ctx.match[1];
         ctx.reply(`⏳ Fetching ${day}'s major matches from StatPal...`);
@@ -271,7 +236,7 @@ if (botToken) {
                 const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
                 items.forEach(m => {
                     const statusText = m.status || '';
-                    const isFin = ['FT', 'AET', 'PEN'].includes(statusText);
+                    const isFin = ['FT', 'AET', 'PEN', 'Finished'].includes(statusText);
                     const isUpc = ['NS', 'TBD', 'POSTP'].includes(statusText) || /^\d{2}:\d{2}$/.test(statusText);
                     
                     let computedStatus = "Upcoming";
@@ -374,10 +339,52 @@ if (botToken) {
         } catch (e) { ctx.reply(`❌ Vision Scan Error: ${e.message}`); }
     });
 
+    bot.on('text', async (ctx, next) => {
+        const session = userSession[ctx.from.id];
+        if (session && session.editing) {
+            const val = ctx.message.text;
+            if (!db) return ctx.reply('❌ Database not connected.');
+
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
+                const snap = await getDoc(docRef);
+                let data = snap.data();
+                const idx = data.matches.findIndex(m => m.id === session.matchId);
+                if (idx !== -1) {
+                    if (session.editing === 'score') {
+                        const s = val.split('-');
+                        data.matches[idx].home.goals = s[0]?.trim();
+                        data.matches[idx].away.goals = s[1]?.trim();
+                    } else if (session.editing === 'pred') {
+                        data.matches[idx].manual_prediction = val;
+                    } else if (session.editing === 'min') {
+                        data.matches[idx].playing_time = val;
+                        if (val === 'FT') data.matches[idx].status = 'Past';
+                        else if (!isNaN(parseInt(val)) || val === 'HT') data.matches[idx].status = 'Live';
+                    } else if (session.editing === 'dt') {
+                        data.matches[idx].date = val.split(' ')[0];
+                        data.matches[idx].time = val.split(' ')[1] || "";
+                    }
+                    
+                    const cleanData = JSON.parse(JSON.stringify(data)); 
+                    await setDoc(docRef, cleanData);
+                    ctx.reply('✅ Site Updated!');
+                }
+                delete userSession[ctx.from.id];
+            } catch (e) { ctx.reply(`❌ Save error: ${e.message}`); }
+            return;
+        }
+        if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') return publishMatches(ctx, false);
+        if (session?.pendingMatches && ctx.message.text === '🧹 Wipe & Replace All') return publishMatches(ctx, true);
+        
+        // CRITICAL: Pass control to other listeners (like the 'Sync API' button) if not matching the above
+        return next();
+    });
+
     async function publishMatches(ctx, wipeFirst) {
         const session = userSession[ctx.from.id];
-        if (!session || !session.pendingMatches) return ctx.reply("❌ Session expired. Please upload again.");
-        if (!db) return ctx.reply('❌ Database not connected. Check FIREBASE_CONFIG in Railway.');
+        if (!session || !session.pendingMatches) return ctx.reply("❌ Session expired.");
+        if (!db) return ctx.reply('❌ Database not connected.');
 
         try {
             const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
@@ -419,7 +426,6 @@ if (botToken) {
                 currentData.matches.unshift(matchObj);
             });
             
-            // JSON stringify/parse ensures ZERO 'undefined' values exist before saving
             const cleanData = JSON.parse(JSON.stringify({ matches: currentData.matches.slice(0, 60) }));
             await setDoc(docRef, cleanData);
             
@@ -461,4 +467,5 @@ app.get('/api/scores', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(port, () => console.log(`Vision Dashboard live on ${port}`));
+// ✅ Fix for Railway Binding Error
+app.listen(port, '0.0.0.0', () => console.log(`Vision Dashboard live on ${port}`));
