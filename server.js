@@ -300,6 +300,15 @@ if (botToken) {
         userSession[ctx.from.id] = { replaceAllMode: true };
     });
 
+    bot.hears('❌ Cancel', (ctx) => { delete userSession[ctx.from.id]; ctx.reply('Cancelled.', getMainMenu()); });
+    
+    bot.hears('🗑️ Clear All Matches', async (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        if (!db) return ctx.reply('❌ Database not connected.');
+        await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), { matches: [] });
+        ctx.reply('Cleared.', getMainMenu());
+    });
+
     // ── Vision Handling ──
     bot.on('photo', async (ctx) => {
         if (!checkAdmin(ctx)) return;
@@ -339,7 +348,7 @@ if (botToken) {
         } catch (e) { ctx.reply(`❌ Vision Scan Error: ${e.message}`); }
     });
 
-    // ✅ FIXED TEXT HANDLER – removed the broken next() call
+    // ✅ FIXED TEXT HANDLER – removed the broken next() call and placed generic text handling at the end
     bot.on('text', async (ctx) => {
         const session = userSession[ctx.from.id];
 
@@ -386,8 +395,7 @@ if (botToken) {
             return publishMatches(ctx, true);
         }
 
-        // 3) If none of the above, Telegraf will automatically check the other bot.hears() handlers
-        // (like Sync API, Clear All, etc.) so we don't need to do anything here.
+        // 3) If none of the above matches, it's just plain text we can ignore.
     });
 
     async function publishMatches(ctx, wipeFirst) {
@@ -446,15 +454,6 @@ if (botToken) {
         }
     }
 
-    bot.hears('❌ Cancel', (ctx) => { delete userSession[ctx.from.id]; ctx.reply('Cancelled.', getMainMenu()); });
-    
-    bot.hears('🗑️ Clear All Matches', async (ctx) => {
-        if (!checkAdmin(ctx)) return;
-        if (!db) return ctx.reply('❌ Database not connected.');
-        await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), { matches: [] });
-        ctx.reply('Cleared.', getMainMenu());
-    });
-
     const launchBot = (retries = 5) => {
         bot.launch().catch(err => {
             if (err.response?.error_code === 409 && retries > 0) {
@@ -499,5 +498,5 @@ app.get('/api/scores', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Start server (bind to 0.0.0.0 for Railway)
+// ✅ Fix for Railway Binding Error
 app.listen(port, '0.0.0.0', () => console.log(`Vision Dashboard live on ${port}`));
