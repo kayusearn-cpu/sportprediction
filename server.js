@@ -9,8 +9,8 @@ const { getFirestore, doc, setDoc, getDoc } = require('firebase/firestore');
 const { getAuth, signInAnonymously } = require('firebase/auth');
 
 const app = express();
-const port = process.env.PORT || 10000; 
-const appId = "magic-betting-tips"; 
+const port = process.env.PORT || 10000;
+const appId = "magic-betting-tips";
 
 app.use(cors());
 app.use(express.json());
@@ -60,7 +60,7 @@ async function fetchFromStatPal(endpoint, params = {}) {
     try {
         const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
             params: { ...params, access_key: STATPAL_KEY },
-            timeout: 15000 
+            timeout: 15000
         });
         return r.data;
     } catch (error) {
@@ -121,7 +121,7 @@ async function syncLiveScores() {
                         currentData.matches[idx].playing_time = statusText;
                     } else {
                         currentData.matches[idx].status = 'Live';
-                        currentData.matches[idx].playing_time = statusText; 
+                        currentData.matches[idx].playing_time = statusText;
                     }
                     updated = true;
                 }
@@ -171,8 +171,8 @@ if (botToken) {
         
         if (isAutoLiveOn) {
             ctx.reply("🚀 *Real-Time Live Sync Started!*\nI will check StatPal every 60 seconds.", { parse_mode: 'Markdown', ...getMainMenu() });
-            syncLiveScores(); 
-            autoLiveInterval = setInterval(syncLiveScores, 60000); 
+            syncLiveScores();
+            autoLiveInterval = setInterval(syncLiveScores, 60000);
         } else {
             ctx.reply("🛑 *Real-Time Live Sync Stopped.*", { parse_mode: 'Markdown', ...getMainMenu() });
             if (autoLiveInterval) clearInterval(autoLiveInterval);
@@ -261,7 +261,7 @@ if (botToken) {
                         leagueName: l.name || "Major League",
                         status: computedStatus,
                         playing_time: computedStatus === "Live" ? statusText : (isFin ? "FT" : ""),
-                        manual_prediction: "", 
+                        manual_prediction: "",
                         country: "API Data"
                     });
                 });
@@ -277,7 +277,7 @@ if (botToken) {
                 const idx = currentData.matches.findIndex(em => em.home.name === newM.home.name && em.away.name === newM.away.name);
                 if (idx !== -1) {
                     newM.manual_prediction = currentData.matches[idx].manual_prediction || "";
-                    currentData.matches[idx] = newM; 
+                    currentData.matches[idx] = newM;
                 } else {
                     currentData.matches.unshift(newM);
                 }
@@ -305,7 +305,7 @@ if (botToken) {
         if (!checkAdmin(ctx)) return;
         if (!openai) return ctx.reply('❌ OpenAI API Key is missing on the server! Please add OPENAI_API_KEY to your Railway Variables.');
         
-        const photo = ctx.message.photo[ctx.message.photo.length - 1]; 
+        const photo = ctx.message.photo[ctx.message.photo.length - 1];
         ctx.reply('⏳ Reading screenshot... Extracting Teams, Dates, Times, Predictions, Scores, and Probabilities!');
 
         try {
@@ -314,10 +314,10 @@ if (botToken) {
             const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
             const completion = await openai.chat.completions.create({
                 model: "gpt-4o-mini",
-                messages: [{ 
-                    role: "system", 
-                    content: "You are an expert football data scraper. Extract EVERY match shown in the image exactly as it appears. Return a JSON object with a 'matches' array. For each match, extract: 'home' (Home team), 'away' (Away team), 'date' (e.g. 19/05/2026), 'time' (e.g. 19:30), 'prediction' (1, X, or 2), 'pScore' (Correct score prediction e.g. 1-3), 'liveScore' (Live or final score), 'min' (FT, HT, or minute), 'lg' (League initials), 'probHome' (Home win prob %), 'probDraw' (Draw prob %), and 'probAway' (Away win prob %). Do not miss the time and date!" 
-                }, 
+                messages: [{
+                    role: "system",
+                    content: "You are an expert football data scraper. Extract EVERY match shown in the image exactly as it appears. Return a JSON object with a 'matches' array. For each match, extract: 'home' (Home team), 'away' (Away team), 'date' (e.g. 19/05/2026), 'time' (e.g. 19:30), 'prediction' (1, X, or 2), 'pScore' (Correct score prediction e.g. 1-3), 'liveScore' (Live or final score), 'min' (FT, HT, or minute), 'lg' (League initials), 'probHome' (Home win prob %), 'probDraw' (Draw prob %), and 'probAway' (Away win prob %). Do not miss the time and date!"
+                },
                 { role: "user", content: [{ type: "text", text: "Scan this screenshot and extract all match details:" }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }] }],
                 response_format: { type: "json_object" }
             });
@@ -339,8 +339,11 @@ if (botToken) {
         } catch (e) { ctx.reply(`❌ Vision Scan Error: ${e.message}`); }
     });
 
-    bot.on('text', async (ctx, next) => {
+    // ✅ FIXED TEXT HANDLER – removed the broken next() call
+    bot.on('text', async (ctx) => {
         const session = userSession[ctx.from.id];
+
+        // 1) Manual editing flow
         if (session && session.editing) {
             const val = ctx.message.text;
             if (!db) return ctx.reply('❌ Database not connected.');
@@ -366,19 +369,25 @@ if (botToken) {
                         data.matches[idx].time = val.split(' ')[1] || "";
                     }
                     
-                    const cleanData = JSON.parse(JSON.stringify(data)); 
+                    const cleanData = JSON.parse(JSON.stringify(data));
                     await setDoc(docRef, cleanData);
                     ctx.reply('✅ Site Updated!');
                 }
                 delete userSession[ctx.from.id];
             } catch (e) { ctx.reply(`❌ Save error: ${e.message}`); }
-            return;
+            return; // stop processing further
         }
-        if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') return publishMatches(ctx, false);
-        if (session?.pendingMatches && ctx.message.text === '🧹 Wipe & Replace All') return publishMatches(ctx, true);
-        
-        // CRITICAL: Pass control to other listeners (like the 'Sync API' button) if not matching the above
-        return next();
+
+        // 2) Confirmation / Wipe actions from screenshot flow
+        if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') {
+            return publishMatches(ctx, false);
+        }
+        if (session?.pendingMatches && ctx.message.text === '🧹 Wipe & Replace All') {
+            return publishMatches(ctx, true);
+        }
+
+        // 3) If none of the above, Telegraf will automatically check the other bot.hears() handlers
+        // (like Sync API, Clear All, etc.) so we don't need to do anything here.
     });
 
     async function publishMatches(ctx, wipeFirst) {
@@ -431,21 +440,32 @@ if (botToken) {
             
             delete userSession[ctx.from.id];
             ctx.reply('✅ Success! Website updated.', getMainMenu());
-        } catch (e) { 
+        } catch (e) {
             console.error("Save Error Details:", e);
-            ctx.reply(`❌ Save Error: ${e.message}`, getMainMenu()); 
+            ctx.reply(`❌ Save Error: ${e.message}`, getMainMenu());
         }
     }
 
     bot.hears('❌ Cancel', (ctx) => { delete userSession[ctx.from.id]; ctx.reply('Cancelled.', getMainMenu()); });
-    bot.hears('🗑️ Clear All Matches', async (ctx) => { if (checkAdmin(ctx)) await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), { matches: [] }); ctx.reply('Cleared.'); });
+    
+    bot.hears('🗑️ Clear All Matches', async (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        if (!db) return ctx.reply('❌ Database not connected.');
+        await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), { matches: [] });
+        ctx.reply('Cleared.', getMainMenu());
+    });
 
     const launchBot = (retries = 5) => {
-        bot.launch().catch(err => { if (err.response?.error_code === 409 && retries > 0) setTimeout(() => launchBot(retries - 1), 10000); });
+        bot.launch().catch(err => {
+            if (err.response?.error_code === 409 && retries > 0) {
+                setTimeout(() => launchBot(retries - 1), 10000);
+            }
+        });
     };
     launchBot();
 }
 
+// ─── Express API endpoints (for your Netlify frontend) ─────────────────────
 app.get('/api/get-predictions', async (req, res) => {
     const { fixture: fixtureId } = req.query;
     try {
@@ -453,7 +473,19 @@ app.get('/api/get-predictions', async (req, res) => {
         if (snap.exists()) {
             const match = (snap.data().matches || []).find(m => m.id === fixtureId);
             if (match && match.manual_prediction) {
-                return res.json({ response: [{ predictions: { percent: { home: match.probabilities?.home ? match.probabilities.home + "%" : "—", draw: match.probabilities?.draw ? match.probabilities.draw + "%" : "—", away: match.probabilities?.away ? match.probabilities.away + "%" : "—" }, advice: match.manual_prediction, code: match.manual_prediction.charAt(0) } }] });
+                return res.json({
+                    response: [{
+                        predictions: {
+                            percent: {
+                                home: match.probabilities?.home ? match.probabilities.home + "%" : "—",
+                                draw: match.probabilities?.draw ? match.probabilities.draw + "%" : "—",
+                                away: match.probabilities?.away ? match.probabilities.away + "%" : "—"
+                            },
+                            advice: match.manual_prediction,
+                            code: match.manual_prediction.charAt(0)
+                        }
+                    }]
+                });
             }
         }
         res.json({ response: [] });
@@ -467,5 +499,5 @@ app.get('/api/scores', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ✅ Fix for Railway Binding Error
+// Start server (bind to 0.0.0.0 for Railway)
 app.listen(port, '0.0.0.0', () => console.log(`Vision Dashboard live on ${port}`));
