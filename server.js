@@ -1,418 +1,495 @@
-// backend/server.js
 const express = require('express');
-const axios   = require('axios');
-const cors    = require('cors');
+const axios = require('axios');
+const cors = require('cors');
+const { Telegraf, Markup } = require('telegraf');
+const { OpenAI } = require('openai');
+const { initializeApp } = require('firebase/app');
+const { getFirestore, doc, setDoc, getDoc } = require('firebase/firestore');
+const { getAuth, signInAnonymously } = require('firebase/auth');
 
-const app  = express();
-const port = process.env.PORT || 3000;
-const SM   = 'https://api.sportmonks.com/v3/football';
+const app = express();
+const port = process.env.PORT || 10000;
+const appId = "magic-betting-tips";
 
 app.use(cors());
 app.use(express.json());
 
-// ─── OpenAI singleton ─────────────────────────────────────────────────────────
-let _openai = null;
-function getOpenAI() {
-    if (!_openai) {
-        const { OpenAI } = require('openai');
-        _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    }
-    return _openai;
-}
+// ─── Admin Security Configuration ────────────────────────────────────────────
+const adminIdsStr = process.env.ADMIN_IDS || "";
+const ADMIN_IDS = adminIdsStr.split(',').map(id => id.trim()).filter(id => id !== "");
 
-// ─── Scores cache ─────────────────────────────────────────────────────────────
-let scoresCache     = null;
-let scoresCacheTime = 0;
-const SCORES_TTL    = 60 * 1000;
+const checkAdmin = (ctx) => {
+    if (ADMIN_IDS.length === 0) return true;
+    const userId = String(ctx.from.id);
+    if (ADMIN_IDS.includes(userId)) return true;
+    ctx.reply(`🚫 *Access Denied*\nYour ID (${userId}) is not authorized.`, { parse_mode: 'Markdown' });
+    return false;
+};
 
-// ─── Prediction cache (TTL: 4 hours) ──────────────────────────────────────────
-const predCache   = {};
-const predCacheTs = {};
-const PRED_TTL    = 4 * 60 * 60 * 1000;
-
-// ─── News cache (TTL: 1 hour) ─────────────────────────────────────────────────
-let newsCache     = null;
-let newsCacheTime = 0;
-const NEWS_TTL    = 60 * 60 * 1000;
-
-// ─── Upcoming cache ───────────────────────────────────────────────────────────
-let upcomingCache     = null;
-let upcomingCacheTime = 0;
-const UPCOMING_TTL    = 5 * 60 * 1000;
-
-// ─── Sportmonks helpers ───────────────────────────────────────────────────────
-function smStatus(state, kickoffTime) {
-    if (!state) return kickoffTime || 'NS';
-    const d = state.developer_name || '';
-    if (d === 'NS')                                                        return kickoffTime || 'NS';
-    if (['INPLAY_1ST_HALF','INPLAY_2ND_HALF','INPLAY_ET'].includes(d))    return state.short_name || 'LIVE';
-    if (d === 'INPLAY_HT')                                                 return 'HT';
-    if (['FT','FT_ONLY','AWARDED'].includes(d))                            return 'FT';
-    if (d === 'AET')                                                       return 'AET';
-    if (['PEN_BREAK','PENALTIES'].includes(d))                             return 'PEN';
-    if (d === 'POSTP')  return 'Postp.';
-    if (d === 'CANCL')  return 'Canc.';
-    if (d === 'SUSP')   return 'Susp.';
-    return state.short_name || kickoffTime || 'NS';
-}
-
-function smGoal(scores, teamId, desc) {
-    return scores?.find(s => s.participant_id === teamId && s.description === desc)?.score?.goals ?? null;
-}
-
-function smFixturesToFlat(fixtures, defaultLeague = '') {
-    const matches = [];
-    fixtures.forEach(f => {
-        if (f.placeholder) return;
-        const home = f.participants?.find(p => p.meta?.location === 'home');
-        const away = f.participants?.find(p => p.meta?.location === 'away');
-        if (!home || !away) return;
-        const time   = f.starting_at?.split(' ')[1]?.substring(0, 5) || '';
-        const status = smStatus(f.state, time);
-        const hC = smGoal(f.scores, home.id, 'CURRENT');
-        const aC = smGoal(f.scores, away.id, 'CURRENT');
-        const hH = smGoal(f.scores, home.id, 'HT');
-        const aH = smGoal(f.scores, away.id, 'HT');
-        const isFt = status === 'FT' || status === 'AET';
-        matches.push({
-            id:         String(f.id),
-            static_id:  String(f.id),
-            date:       f.starting_at?.split(' ')[0] || '',
-            time,
-            status,
-            leagueName: f.league?.name  || defaultLeague,
-            country:    f.league?.country?.name || '',
-            home: { id: String(home.id), name: home.name, goals: hC !== null ? String(hC) : null, logo: home.image_path || null },
-            away: { id: String(away.id), name: away.name, goals: aC !== null ? String(aC) : null, logo: away.image_path || null },
-            ht:   hH !== null ? { score: `[${hH}-${aH}]` } : null,
-            ft:   isFt && hC !== null ? { score: `[${hC}-${aC}]` } : null,
-        });
-    });
-    return matches;
-}
-
-async function smFixturesByDate(date, key, include = 'participants;league.country;state;scores') {
-    const all = [];
-    let page = 1, hasMore = true;
-    while (hasMore && page <= 4) {
-        const r = await axios.get(`${SM}/fixtures/date/${date}`, {
-            params: { include, api_token: key, per_page: 100, page },
-            timeout: 12000,
-        });
-        all.push(...(r.data?.data || []));
-        hasMore = r.data?.pagination?.has_more === true;
-        page++;
-    }
-    return all;
-}
-
-function smParsePredictions(predictions) {
-    if (!predictions?.length) return null;
-    const ftP = predictions.find(p => p.type?.developer_name === 'FULLTIME_RESULT_PROBABILITY');
-    if (!ftP?.predictions) return null;
-    const { home = 33, away = 33, draw = 34 } = ftP.predictions;
-    const h = Math.round(home), d = Math.round(draw), a = Math.round(away);
-    const csP = predictions.find(p => p.type?.developer_name === 'CORRECT_SCORE_PROBABILITY');
-    let gh = 1, ga = 0, bestScore = null;
-    if (csP?.predictions?.scores) {
-        let maxP = 0;
-        Object.entries(csP.predictions.scores).forEach(([sc, prob]) => {
-            if (typeof prob === 'number' && !sc.startsWith('Other') && prob > maxP) {
-                maxP = prob; bestScore = sc;
-            }
-        });
-        if (bestScore) [gh, ga] = bestScore.split('-').map(Number);
-    }
-    const code  = h >= a && h >= d ? '1' : a > h && a >= d ? '2' : 'X';
-    const label = code === '1' ? 'Home Win' : code === '2' ? 'Away Win' : 'Draw';
-    return { response: [{ predictions: {
-        percent: { home: `${h}%`, draw: `${d}%`, away: `${a}%` },
-        goals:   bestScore ? { home: gh, away: ga } : null,
-        advice:  `${label} — ${h}% home / ${d}% draw / ${a}% away`,
-    }}]};
-}
-
-// ─── API-Football helpers ─────────────────────────────────────────────────────
-function mapApfStatus(short, elapsed, fixtureDate) {
-    switch (short) {
-        case '1H': case '2H': case 'ET': return elapsed ? String(elapsed) : short;
-        case 'HT': case 'BT': case 'FT': case 'AET': return short;
-        case 'PEN': case 'P':  return 'PEN';
-        case 'PST':  return 'Postp.';
-        case 'CANC': return 'Canc.';
-        case 'SUSP': return 'Susp.';
-        case 'WO': case 'AWD': case 'ABD': case 'INT': return short;
-        case 'NS': default:
-            if (fixtureDate) {
-                try {
-                    const d  = new Date(fixtureDate);
-                    const hh = String(d.getUTCHours()).padStart(2, '0');
-                    const mm = String(d.getUTCMinutes()).padStart(2, '0');
-                    return `${hh}:${mm}`;
-                } catch (_) {}
-            }
-            return 'NS';
-    }
-}
-
-function apfFixturesToFlat(fixtures) {
-    const today = new Date().toISOString().split('T')[0];
-    return fixtures.map(f => {
-        const status = mapApfStatus(f.fixture.status.short, f.fixture.status.elapsed, f.fixture.date);
-        const ht = f.score.halftime, ft = f.score.fulltime;
-        return {
-            id:         String(f.fixture.id),
-            static_id:  String(f.fixture.id),
-            date:       f.fixture.date ? f.fixture.date.split('T')[0] : today,
-            time:       f.fixture.date ? (f.fixture.date.split('T')[1] || '').substring(0, 5) : '',
-            status,
-            leagueName: f.league.name,
-            country:    f.league.country,
-            home: { id: String(f.teams.home.id), name: f.teams.home.name, goals: f.goals.home != null ? String(f.goals.home) : null },
-            away: { id: String(f.teams.away.id), name: f.teams.away.name, goals: f.goals.away != null ? String(f.goals.away) : null },
-            ht: (ht && ht.home != null) ? { score: `[${ht.home}-${ht.away}]` } : null,
-            ft: (ft && ft.home != null) ? { score: `[${ft.home}-${ft.away}]` } : null,
-        };
-    });
-}
-
-// ─── StatPal: status mapper ───────────────────────────────────────────────────
-function mapStatpalStatus(status, matchStart) {
-    if (status === undefined || status === null) return matchStart || 'NS';
-    const s = String(status).trim();
-    if (s === 'HT') return 'HT';
-    if (s === 'FT' || s === 'Ended') return 'FT';
-    if (s === 'AET' || s === 'FT_ET') return 'AET';
-    if (s === 'PEN' || s === 'PENALTIES' || s === 'PEN_BREAK') return 'PEN';
-    if (['POSTP','Postponed','postponed'].includes(s)) return 'Postp.';
-    if (['CANC','Cancelled','cancelled'].includes(s)) return 'Canc.';
-    if (['SUSP','Suspended','suspended'].includes(s)) return 'Susp.';
-    if (/^\d+$/.test(s) && Number(s) > 0) return s;  // live minute e.g. "45"
-    if (s === '0' || s === 'NS' || s === 'Not started' || s === '') return matchStart || 'NS';
-    return matchStart || 'NS';
-}
-
-// ─── StatPal: flatten nested livescore → normalized flat matches ───────────────
-function statpalToFlat(livescore) {
-    if (!livescore?.league) return [];
-    const leagues = Array.isArray(livescore.league) ? livescore.league : [livescore.league];
-    const matches = [];
-    const today = new Date().toISOString().split('T')[0];
-    leagues.forEach(lg => {
-        const items = Array.isArray(lg.match) ? lg.match : (lg.match ? [lg.match] : []);
-        items.forEach(m => {
-            const homeGoals = (m.home?.score != null && m.home.score !== '') ? String(m.home.score) : null;
-            const awayGoals = (m.away?.score != null && m.away.score !== '') ? String(m.away.score) : null;
-            const kickoff   = m.match_start || m.time || '';
-            const status    = mapStatpalStatus(m.status, kickoff);
-            const isFt      = status === 'FT' || status === 'AET';
-
-            let htObj = null;
-            if (m.ht_score && String(m.ht_score).includes('-')) {
-                const [hh, ah] = String(m.ht_score).split('-');
-                htObj = { score: `[${hh.trim()}-${ah.trim()}]` };
-            }
-
-            matches.push({
-                id:         String(m.id || ''),
-                static_id:  String(m.id || ''),
-                date:       m.date || today,
-                time:       kickoff,
-                status,
-                leagueName: lg.name || '',
-                country:    typeof lg.country === 'string' ? lg.country : (lg.country?.name || ''),
-                home: {
-                    id:    String(m.home?.id || ''),
-                    name:  m.home?.name || '',
-                    goals: homeGoals,
-                    logo:  m.home?.image_path || null,
-                },
-                away: {
-                    id:    String(m.away?.id || ''),
-                    name:  m.away?.name || '',
-                    goals: awayGoals,
-                    logo:  m.away?.image_path || null,
-                },
-                ht: htObj,
-                ft: isFt && homeGoals !== null ? { score: `[${homeGoals}-${awayGoals}]` } : null,
-            });
-        });
-    });
-    return matches;
-}
-
-// ─── /api/scores ──────────────────────────────────────────────────────────────
-//  Priority: StatPal → API-Football → Sportmonks → stale cache
-app.get('/api/scores', async (req, res) => {
-    if (scoresCache && (Date.now() - scoresCacheTime < SCORES_TTL)) return res.json(scoresCache);
-
-    const smKey      = process.env.SPORTMONKS_KEY;
-    const apfKey     = process.env.API_FOOTBALL_KEY;
-    const statpalKey = process.env.STATPAL_API_KEY || '98e5c7b5-5b16-412c-a270-c3196e4ef98f';
-    const today      = new Date().toISOString().split('T')[0];
-
-    // 1: StatPal
+// ─── Firebase Initialization (WITH AUTHENTICATION) ───────────────────────────
+const firebaseConfigStr = process.env.FIREBASE_CONFIG;
+let db = null;
+if (firebaseConfigStr) {
     try {
-        const r = await axios.get('https://statpal.io/api/v1/soccer/livescores', {
-            params: { access_key: statpalKey }, timeout: 10000,
-        });
-        const matches = statpalToFlat(r.data?.livescore);
-        if (matches.length > 0) {
-            const result = { matches, source: 'statpal', updated: new Date().toISOString() };
-            scoresCache = result; scoresCacheTime = Date.now();
-            console.log(`StatPal: ${matches.length} matches loaded`);
-            return res.json(result);
-        }
-        console.warn('StatPal: returned 0 matches');
-    } catch (e) { console.error('StatPal failed:', e.message); }
-
-    // 2: API-Football
-    if (apfKey) {
-        try {
-            const r = await axios.get('https://v3.football.api-sports.io/fixtures', {
-                params: { date: today }, headers: { 'x-apisports-key': apfKey }, timeout: 10000,
-            });
-            const body = r.data, fixtures = body.response || [];
-            const hasErrors = body.errors && (Array.isArray(body.errors) ? body.errors.length > 0 : Object.keys(body.errors).length > 0);
-            if (!hasErrors && fixtures.length > 0) {
-                const matches = apfFixturesToFlat(fixtures);
-                const result  = { matches, source: 'api-football', updated: new Date().toISOString() };
-                scoresCache = result; scoresCacheTime = Date.now();
-                console.log(`API-Football: ${matches.length} matches loaded`);
-                return res.json(result);
-            }
-        } catch (e) { console.error('API-Football failed:', e.message); }
-    }
-
-    // 3: Sportmonks
-    if (smKey) {
-        try {
-            const fixtures = await smFixturesByDate(today, smKey);
-            const matches  = smFixturesToFlat(fixtures);
-            if (matches.length > 0) {
-                const result = { matches, source: 'sportmonks', updated: new Date().toISOString() };
-                scoresCache = result; scoresCacheTime = Date.now();
-                console.log(`Sportmonks: ${matches.length} matches loaded`);
-                return res.json(result);
-            }
-            console.warn('Sportmonks: 0 fixtures for today');
-        } catch (e) { console.error('Sportmonks failed:', e.message); }
-    }
-
-    if (scoresCache) { console.warn('Serving stale cache'); return res.json(scoresCache); }
-    res.status(500).json({ error: 'All data sources failed', matches: [] });
-});
-
-// ─── /api/status ──────────────────────────────────────────────────────────────
-app.get('/api/status', async (req, res) => {
-    const smKey  = process.env.SPORTMONKS_KEY;
-    const apfKey = process.env.API_FOOTBALL_KEY;
-    const result = {
-        sportmonks_key_set:   !!smKey,
-        api_football_key_set: !!apfKey,
-        openai_key_set:       !!process.env.OPENAI_API_KEY,
-        cache: null,
-    };
-    if (scoresCache) result.cache = {
-        source:       scoresCache.source,
-        match_count:  scoresCache.matches?.length,
-        updated:      scoresCache.updated,
-        age_seconds:  Math.round((Date.now() - scoresCacheTime) / 1000),
-    };
-    if (apfKey) {
-        try {
-            const c = await axios.get('https://v3.football.api-sports.io/status', { headers: { 'x-apisports-key': apfKey }, timeout: 8000 });
-            result.api_football = c.data.response || c.data;
-        } catch (e) { result.api_football = { error: e.message }; }
-    }
-    res.json(result);
-});
-
-// ─── /api/cache/clear ─────────────────────────────────────────────────────────
-app.post('/api/cache/clear', (req, res) => {
-    scoresCache = null;   scoresCacheTime = 0;
-    upcomingCache = null; upcomingCacheTime = 0;
-    newsCache = null;     newsCacheTime = 0;
-    Object.keys(predCache).forEach(k => { delete predCache[k]; delete predCacheTs[k]; });
-    console.log('All caches cleared');
-    res.json({ cleared: true, timestamp: new Date().toISOString() });
-});
-
-// ─── Math fallback prediction ─────────────────────────────────────────────────
-function generatePrediction(fixtureId) {
-    const seed = String(fixtureId).split('').reduce((a, c, i) => a + c.charCodeAt(0) * (i + 1), 7);
-    const r = n => { const x = Math.sin(seed * n + n * 13.7) * 99991; return x - Math.floor(x); };
-    const hw = Math.round(40 + r(1) * 16), dw = Math.round(22 + r(2) * 8), aw = 100 - hw - dw;
-    const hg = Math.min(4, Math.round(r(3) * 3.2)), ag = Math.min(3, Math.round(r(4) * 2.4));
-    const best   = hw >= aw && hw >= dw ? 'home' : aw >= hw && aw >= dw ? 'away' : 'draw';
-    const advice = best === 'home' ? 'Home Win Predicted' : best === 'away' ? 'Away Win Predicted' : 'Draw Predicted';
-    return { response: [{ predictions: { percent: { home: `${hw}%`, draw: `${dw}%`, away: `${aw}%` }, goals: { home: hg, away: ag }, advice } }] };
+        const firebaseApp = initializeApp(JSON.parse(firebaseConfigStr.trim()));
+        db = getFirestore(firebaseApp);
+        const auth = getAuth(firebaseApp);
+        
+        signInAnonymously(auth)
+            .then(() => console.log("🔥 Firebase Authenticated Successfully."))
+            .catch(err => console.error("❌ Firebase Auth Error:", err.message));
+            
+        console.log("🔥 Firebase Database connected.");
+    } catch (err) { console.error("❌ Firebase Config Error:", err.message); }
 }
 
-// ─── /api/get-predictions ─────────────────────────────────────────────────────
-//  Priority: Sportmonks → API-Football → OpenAI gpt-4o-mini → math fallback
-app.get('/api/get-predictions', async (req, res) => {
-    const { fixture: fixtureId, home, away, league, country, status, score } = req.query;
-    const smKey     = process.env.SPORTMONKS_KEY;
-    const apfKey    = process.env.API_FOOTBALL_KEY;
-    const openaiKey = process.env.OPENAI_API_KEY;
+// ─── OpenAI Initialization ───────────────────────────────────────────────────
+let openai = null;
+if (process.env.OPENAI_API_KEY) {
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY.trim() });
+} else {
+    console.warn("⚠️ OPENAI_API_KEY is missing! Server will run, but Vision features will be disabled.");
+}
 
-    if (!fixtureId) return res.status(400).json({ error: 'fixture ID required' });
+// ─── StatPal API Integration ─────────────────────────────────────────────────
+const STATPAL_KEY = process.env.STATPAL_API_KEY || 'bcd42a3c-46ce-4dd2-aaae-320cf9d98f22';
+const MAJOR_LEAGUES = [8, 301, 384, 82, 564, 2, 3, 4, 693, 400, 462, 556, 1, 30];
 
-    const cached = predCache[fixtureId];
-    if (cached && (Date.now() - predCacheTs[fixtureId] < PRED_TTL)) return res.json(cached);
-
-    // 1. Sportmonks — only works with numeric Sportmonks IDs
-    if (smKey && /^\d+$/.test(fixtureId)) {
-        try {
-            const r = await axios.get(`${SM}/fixtures/${fixtureId}`, {
-                params: { include: 'predictions.type', api_token: smKey }, timeout: 8000,
-            });
-            const result = smParsePredictions(r.data?.data?.predictions);
-            if (result) { predCache[fixtureId] = result; predCacheTs[fixtureId] = Date.now(); return res.json(result); }
-        } catch (e) { console.warn('Sportmonks predictions failed:', e.message); }
+async function fetchFromStatPal(endpoint, params = {}) {
+    try {
+        const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
+            params: { ...params, access_key: STATPAL_KEY },
+            timeout: 15000
+        });
+        return r.data;
+    } catch (error) {
+        console.error(`❌ StatPal Error [${endpoint}]:`, error.message);
+        return null;
     }
+}
 
-    // 2. API-Football — only works with numeric API-Football IDs
-    if (apfKey && /^\d+$/.test(fixtureId)) {
-        try {
-            const r = await axios.get('https://v3.football.api-sports.io/predictions', {
-                params: { fixture: fixtureId }, headers: { 'x-apisports-key': apfKey }, timeout: 8000,
+// ─── Auto-Live Sync Logic ────────────────────────────────────────────────────
+let autoLiveInterval = null;
+let isAutoLiveOn = false;
+
+async function syncLiveScores() {
+    if (!db) return;
+    try {
+        const data = await fetchFromStatPal('livescores');
+        if (!data || !data.livescore || !data.livescore.league) return;
+
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
+        const snap = await getDoc(docRef);
+        if (!snap.exists()) return;
+        
+        let currentData = snap.data();
+        let updated = false;
+
+        const leagues = Array.isArray(data.livescore.league) ? data.livescore.league : [data.livescore.league];
+        
+        leagues.forEach(l => {
+            const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
+            items.forEach(m => {
+                const idx = currentData.matches.findIndex(em => 
+                    (em.id === `api_${m.id}`) || 
+                    (em.home.name.toLowerCase() === m.home.name.toLowerCase() && em.away.name.toLowerCase() === m.away.name.toLowerCase())
+                );
+
+                if (idx !== -1) {
+                    const statusText = m.status || '';
+                    let hGoal = null, aGoal = null;
+                    if (m.score && m.score.includes('-')) {
+                        hGoal = m.score.split('-')[0].trim();
+                        aGoal = m.score.split('-')[1].trim();
+                    } else if (m.home?.goals !== undefined) {
+                        hGoal = m.home.goals;
+                        aGoal = m.away.goals;
+                    }
+
+                    currentData.matches[idx].home.goals = hGoal;
+                    currentData.matches[idx].away.goals = aGoal;
+                    
+                    const isFin = ['FT', 'AET', 'PEN', 'Finished'].includes(statusText);
+                    const isUpc = ['NS', 'TBD', 'POSTP'].includes(statusText) || /^\d{2}:\d{2}$/.test(statusText);
+
+                    if (isFin) {
+                        currentData.matches[idx].status = 'Past';
+                        currentData.matches[idx].playing_time = 'FT';
+                    } else if (isUpc) {
+                        currentData.matches[idx].status = 'Upcoming';
+                        currentData.matches[idx].playing_time = statusText;
+                    } else {
+                        currentData.matches[idx].status = 'Live';
+                        currentData.matches[idx].playing_time = statusText;
+                    }
+                    updated = true;
+                }
             });
-            if (r.data.response?.length > 0 && r.data.response[0]?.predictions) {
-                predCache[fixtureId] = r.data; predCacheTs[fixtureId] = Date.now();
-                return res.json(r.data);
-            }
-        } catch (e) { console.warn('API-Football predictions failed:', e.message); }
+        });
+
+        if (updated) {
+            const cleanData = JSON.parse(JSON.stringify(currentData));
+            await setDoc(docRef, cleanData);
+            console.log("⏱️ Auto-Live Sync updated live scores on the site.");
+        }
+    } catch(e) {
+        console.error("Auto-Live Sync Error:", e.message);
     }
+}
 
-    // 3. OpenAI gpt-4o-mini — always works as long as team names are provided
-    if (openaiKey && home && away) {
+// ─── Telegram Bot Logic ──────────────────────────────────────────────────────
+const botToken = process.env.TELEGRAM_BOT_TOKEN;
+let bot = null;
+
+if (botToken) {
+    bot = new Telegraf(botToken);
+    const userSession = {};
+
+    const getMainMenu = () => Markup.keyboard([
+        ['🔴 Live', '✅ Past Results', '🔵 Upcoming'],
+        ['🔄 Sync API: Today', '🔄 Sync API: Tomorrow'],
+        [`⏱️ Auto-Live Sync: ${isAutoLiveOn ? 'ON' : 'OFF'}`],
+        ['📸 Upload Screenshot', '🧹 Replace All with Upcoming'],
+        ['🗑️ Clear All Matches']
+    ]).resize();
+
+    bot.command('myid', (ctx) => ctx.reply(`ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' }));
+
+    bot.start((ctx) => {
+        if (!checkAdmin(ctx)) return;
+        ctx.reply('⚽ *Magic AI Dashboard*\n\nTurn on **Auto-Live Sync** to automatically refresh match minutes and scores in real-time!', {
+            parse_mode: 'Markdown',
+            ...getMainMenu()
+        });
+    });
+
+    bot.hears(/⏱️ Auto-Live Sync: (OFF|ON)/, (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        isAutoLiveOn = !isAutoLiveOn;
+        
+        if (isAutoLiveOn) {
+            ctx.reply("🚀 *Real-Time Live Sync Started!*\nI will check StatPal every 60 seconds.", { parse_mode: 'Markdown', ...getMainMenu() });
+            syncLiveScores();
+            autoLiveInterval = setInterval(syncLiveScores, 60000);
+        } else {
+            ctx.reply("🛑 *Real-Time Live Sync Stopped.*", { parse_mode: 'Markdown', ...getMainMenu() });
+            if (autoLiveInterval) clearInterval(autoLiveInterval);
+        }
+    });
+
+    const showCategory = async (ctx, statusFilter) => {
+        if (!checkAdmin(ctx)) return;
+        if (!db) return ctx.reply('❌ Database not connected.');
+        
+        const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
+        const matches = (snap.exists() ? snap.data().matches : []).filter(m => m.status === statusFilter);
+        if (matches.length === 0) return ctx.reply(`No ${statusFilter} matches.`);
+        const buttons = matches.slice(0, 15).map(m => [Markup.button.callback(`${m.home.name} vs ${m.away.name}`, `sel_${m.id}`)]);
+        ctx.reply(`Manage ${statusFilter}:`, Markup.inlineKeyboard(buttons));
+    };
+
+    bot.hears('🔴 Live', (ctx) => showCategory(ctx, 'Live'));
+    bot.hears('✅ Past Results', (ctx) => showCategory(ctx, 'Past'));
+    bot.hears('🔵 Upcoming', (ctx) => showCategory(ctx, 'Upcoming'));
+
+    bot.action(/sel_(.+)/, async (ctx) => {
+        const matchId = ctx.match[1];
+        ctx.answerCbQuery();
+        ctx.reply('Editor Settings:', Markup.inlineKeyboard([
+            [Markup.button.callback('⚽ Edit Live Score', `edit_score_${matchId}`)],
+            [Markup.button.callback('🎯 Edit Prediction', `edit_pred_${matchId}`)],
+            [Markup.button.callback('🕒 Edit Minute', `edit_min_${matchId}`), Markup.button.callback('📅 Edit Date', `edit_dt_${matchId}`)],
+            [Markup.button.callback('🗑️ Delete Match', `delete_${matchId}`)]
+        ]));
+    });
+
+    bot.action(/edit_(score|pred|min|dt)_(.+)/, (ctx) => {
+        userSession[ctx.from.id] = { matchId: ctx.match[2], editing: ctx.match[1] };
+        ctx.answerCbQuery();
+        const p = { score: "New Score (e.g. 1-1):", pred: "New Prediction (e.g. 1, X, 2):", min: "New Minute (e.g. 45, HT, FT):", dt: "New Date/Time:" };
+        ctx.reply(p[ctx.match[1]]);
+    });
+
+    bot.hears(/🔄 Sync API: (Today|Tomorrow)/, async (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        if (!db) return ctx.reply('❌ Database not connected.');
+
+        const day = ctx.match[1];
+        ctx.reply(`⏳ Fetching ${day}'s major matches from StatPal...`);
+        
+        const targetDate = new Date();
+        if (day === 'Tomorrow') targetDate.setDate(targetDate.getDate() + 1);
+        const dateStr = targetDate.toISOString().split('T')[0];
+
         try {
-            const openai = getOpenAI();
-            const ctx = [
-                league  ? `Competition: ${league}${country ? ' ('+country+')' : ''}` : null,
-                status  ? `Match status: ${status}` : null,
-                score   ? `Current score: ${score}` : null,
-            ].filter(Boolean).join(' | ');
+            const data = await fetchFromStatPal('fixtures', { date: dateStr });
+            if (!data) return ctx.reply('❌ Failed to fetch from API. Check key limits.');
+            
+            const matchesToSave = [];
+            const leagues = data.livescore?.league || (Array.isArray(data.data) ? [{match: data.data}] : []);
+            
+            leagues.forEach(l => {
+                if (l.id && !MAJOR_LEAGUES.includes(Number(l.id))) return;
 
+                const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
+                items.forEach(m => {
+                    const statusText = m.status || '';
+                    const isFin = ['FT', 'AET', 'PEN', 'Finished'].includes(statusText);
+                    const isUpc = ['NS', 'TBD', 'POSTP'].includes(statusText) || /^\d{2}:\d{2}$/.test(statusText);
+                    
+                    let computedStatus = "Upcoming";
+                    if (isFin) computedStatus = "Past";
+                    else if (!isUpc) computedStatus = "Live";
+
+                    let hGoal = null, aGoal = null;
+                    if (m.score && m.score.includes('-')) {
+                        hGoal = m.score.split('-')[0].trim();
+                        aGoal = m.score.split('-')[1].trim();
+                    } else if (m.home?.goals !== undefined) {
+                        hGoal = m.home.goals;
+                        aGoal = m.away.goals;
+                    }
+
+                    matchesToSave.push({
+                        id: `api_${m.id || Date.now()}`,
+                        date: dateStr,
+                        time: m.time || (isUpc ? statusText : ""),
+                        home: { name: m.home?.name || 'Home', goals: hGoal },
+                        away: { name: m.away?.name || 'Away', goals: aGoal },
+                        leagueName: l.name || "Major League",
+                        status: computedStatus,
+                        playing_time: computedStatus === "Live" ? statusText : (isFin ? "FT" : ""),
+                        manual_prediction: "",
+                        country: "API Data"
+                    });
+                });
+            });
+
+            if (matchesToSave.length === 0) return ctx.reply(`❌ No major matches found for ${day}.`);
+
+            const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
+            const snap = await getDoc(docRef);
+            let currentData = snap.exists() ? snap.data() : { matches: [] };
+
+            matchesToSave.forEach(newM => {
+                const idx = currentData.matches.findIndex(em => em.home.name === newM.home.name && em.away.name === newM.away.name);
+                if (idx !== -1) {
+                    newM.manual_prediction = currentData.matches[idx].manual_prediction || "";
+                    currentData.matches[idx] = newM;
+                } else {
+                    currentData.matches.unshift(newM);
+                }
+            });
+            
+            const cleanData = JSON.parse(JSON.stringify({ matches: currentData.matches.slice(0, 60) }));
+            await setDoc(docRef, cleanData);
+            ctx.reply(`✅ Successfully synced ${matchesToSave.length} matches for ${day}!\n\nMatches were automatically sorted into Live, Upcoming, and Past.`);
+            
+            if (isAutoLiveOn) syncLiveScores();
+
+        } catch(e) {
+            ctx.reply(`❌ API Error: ${e.message}`);
+        }
+    });
+
+    bot.hears('🧹 Replace All with Upcoming', (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        ctx.reply('📸 Please upload a screenshot. I will DELETE all existing matches and replace them with these as "Upcoming".');
+        userSession[ctx.from.id] = { replaceAllMode: true };
+    });
+
+    // ── Vision Handling ──
+    bot.on('photo', async (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        if (!openai) return ctx.reply('❌ OpenAI API Key is missing on the server! Please add OPENAI_API_KEY to your Railway Variables.');
+        
+        const photo = ctx.message.photo[ctx.message.photo.length - 1];
+        ctx.reply('⏳ Reading screenshot... Extracting Teams, Dates, Times, Predictions, Scores, and Probabilities!');
+
+        try {
+            const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+            const imageResponse = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+            const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
             const completion = await openai.chat.completions.create({
-                model: 'gpt-4o-mini',
-                messages: [
-                    {
-                        role: 'system',
-                        content: `You are an elite football prediction analyst. Use Poisson distribution methodology — like Forebet and WinDrawWin — factoring in:\n• Team attack/defense xG ratings and season averages\n• Home advantage (adds ~0.35 expected goals to home team)\n• Recent 5-match form, current injuries, squad depth\n• Head-to-head record (last 5 meetings)\n• League position, goal difference, and momentum\n\nYou MUST respond ONLY with raw JSON — no markdown fences, no extra text, nothing else:\n{"home":55,"draw":26,"away":19,"homeGoals":2,"awayGoals":1,"advice":"One sharp sentence (max 20 words) with specific insight about this fixture"}\n\nRules: home+draw+away must sum to exactly 100. All numbers must be integers.`,
-                    },
-                    {
-                        role: 'user',
-                        content: `Predict: ${home} vs ${away}${ctx ? '\n' + ctx : ''}`,
-                    },
-                ],
-                max_tokens: 150,
-                temperature: 0.25,
+                model: "gpt-4o-mini",
+                messages: [{
+                    role: "system",
+                    content: "You are an expert football data scraper. Extract EVERY match shown in the image exactly as it appears. Return a JSON object with a 'matches' array. For each match, extract: 'home' (Home team), 'away' (Away team), 'date' (e.g. 19/05/2026), 'time' (e.g. 19:30), 'prediction' (1, X, or 2), 'pScore' (Correct score prediction e.g. 1-3), 'liveScore' (Live or final score), 'min' (FT, HT, or minute), 'lg' (League initials), 'probHome' (Home win prob %), 'probDraw' (Draw prob %), and 'probAway' (Away win prob %). Do not miss the time and date!"
+                },
+                { role: "user", content: [{ type: "text", text: "Scan this screenshot and extract all match details:" }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }] }],
+                response_format: { type: "json_object" }
+            });
+            const matches = JSON.parse(completion.choices[0].message.content).matches || [];
+            if (matches.length === 0) return ctx.reply("❌ No matches detected. Try a clearer image.");
+            
+            const isReplace = userSession[ctx.from.id]?.replaceAllMode || false;
+            userSession[ctx.from.id] = { pendingMatches: matches, replaceAllMode: isReplace };
+
+            let summary = `🔍 Detected ${matches.length} matches:\n\n`;
+            matches.forEach((m, i) => {
+                const dt = m.date ? `[${m.date} ${m.time || ''}]` : "";
+                const probs = m.probHome ? `(Prob: ${m.probHome}% | ${m.probDraw}% | ${m.probAway}%)` : "";
+                summary += `${i+1}. *${m.home} vs ${m.away}* ${dt}\n🎯 Tip: ${m.prediction || m.pred} | Score: ${m.pScore || ''} \n📊 ${probs}\n\n`;
             });
 
-            const raw  = completion.choices[0].message.content.trim().replace(/```json|```/g, '').trim();
-            const pred = JSON.parse(raw);
-            const h    = Math.min(90, Math.max(5,  Math.round(Number(pred.home)  || 45)));
-            const d    = Math.min(60, Math.max(5,  Math.round(Number
+            const btns = isReplace ? [['🧹 Wipe & Replace All'], ['❌ Cancel']] : [['🚀 Confirm & Publish'], ['❌ Cancel']];
+            ctx.reply(summary, { parse_mode: 'Markdown', ...Markup.keyboard(btns).resize() });
+        } catch (e) { ctx.reply(`❌ Vision Scan Error: ${e.message}`); }
+    });
+
+    // ✅ FIXED text handler – passes unknown messages to other handlers
+    bot.on('text', async (ctx, next) => {
+        const session = userSession[ctx.from.id];
+
+        // 1) Manual editing flow
+        if (session && session.editing) {
+            const val = ctx.message.text;
+            if (!db) return ctx.reply('❌ Database not connected.');
+
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
+                const snap = await getDoc(docRef);
+                let data = snap.data();
+                const idx = data.matches.findIndex(m => m.id === session.matchId);
+                if (idx !== -1) {
+                    if (session.editing === 'score') {
+                        const s = val.split('-');
+                        data.matches[idx].home.goals = s[0]?.trim();
+                        data.matches[idx].away.goals = s[1]?.trim();
+                    } else if (session.editing === 'pred') {
+                        data.matches[idx].manual_prediction = val;
+                    } else if (session.editing === 'min') {
+                        data.matches[idx].playing_time = val;
+                        if (val === 'FT') data.matches[idx].status = 'Past';
+                        else if (!isNaN(parseInt(val)) || val === 'HT') data.matches[idx].status = 'Live';
+                    } else if (session.editing === 'dt') {
+                        data.matches[idx].date = val.split(' ')[0];
+                        data.matches[idx].time = val.split(' ')[1] || "";
+                    }
+                    
+                    const cleanData = JSON.parse(JSON.stringify(data));
+                    await setDoc(docRef, cleanData);
+                    ctx.reply('✅ Site Updated!');
+                }
+                delete userSession[ctx.from.id];
+            } catch (e) { ctx.reply(`❌ Save error: ${e.message}`); }
+            return;
+        }
+
+        // 2) Confirmation / Wipe actions from screenshot flow
+        if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') {
+            return publishMatches(ctx, false);
+        }
+        if (session?.pendingMatches && ctx.message.text === '🧹 Wipe & Replace All') {
+            return publishMatches(ctx, true);
+        }
+
+        // 3) Not a session action → let other handlers (Sync API, Clear All, etc.) process it
+        return next();
+    });
+
+    async function publishMatches(ctx, wipeFirst) {
+        const session = userSession[ctx.from.id];
+        if (!session || !session.pendingMatches) return ctx.reply("❌ Session expired.");
+        if (!db) return ctx.reply('❌ Database not connected.');
+
+        try {
+            const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
+            let currentData = { matches: [] };
+            if (!wipeFirst) {
+                const snap = await getDoc(docRef);
+                currentData = snap.exists() ? snap.data() : { matches: [] };
+            }
+
+            session.pendingMatches.forEach(m => {
+                let status = wipeFirst ? "Upcoming" : (m.min === 'FT' ? "Past" : (m.min || m.liveScore ? "Live" : "Upcoming"));
+                
+                let hGoal = null;
+                let aGoal = null;
+                if (!wipeFirst && m.liveScore) {
+                    const scoreStr = String(m.liveScore).replace(':', '-');
+                    const parts = scoreStr.split('-');
+                    hGoal = parts[0] ? parts[0].trim() : null;
+                    aGoal = parts[1] ? parts[1].trim() : null;
+                }
+
+                const matchObj = {
+                    id: `v_${Date.now()}_${Math.random().toString(36).substr(2, 2)}`,
+                    date: m.date || new Date().toLocaleDateString('en-GB'),
+                    time: m.time || "",
+                    home: { name: m.home || 'Unknown', goals: hGoal },
+                    away: { name: m.away || 'Unknown', goals: aGoal },
+                    leagueName: m.lg || "Pro League",
+                    status: status,
+                    playing_time: wipeFirst ? "" : (m.min || ""),
+                    manual_prediction: `${m.prediction || m.pred || ''} (${m.pScore || ''})`.trim(),
+                    probabilities: {
+                        home: m.probHome || null,
+                        draw: m.probDraw || null,
+                        away: m.probAway || null
+                    },
+                    country: "Pro Tip"
+                };
+                currentData.matches.unshift(matchObj);
+            });
+            
+            const cleanData = JSON.parse(JSON.stringify({ matches: currentData.matches.slice(0, 60) }));
+            await setDoc(docRef, cleanData);
+            
+            delete userSession[ctx.from.id];
+            ctx.reply('✅ Success! Website updated.', getMainMenu());
+        } catch (e) {
+            console.error("Save Error Details:", e);
+            ctx.reply(`❌ Save Error: ${e.message}`, getMainMenu());
+        }
+    }
+
+    bot.hears('❌ Cancel', (ctx) => { delete userSession[ctx.from.id]; ctx.reply('Cancelled.', getMainMenu()); });
+    
+    bot.hears('🗑️ Clear All Matches', async (ctx) => {
+        if (!checkAdmin(ctx)) return;
+        if (!db) return ctx.reply('❌ Database not connected.');
+        await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'), { matches: [] });
+        ctx.reply('Cleared.', getMainMenu());
+    });
+
+    bot.launch()
+        .then(() => console.log('✅ Bot is polling successfully'))
+        .catch(err => console.error('🚨 Bot launch error:', err.message));
+}
+
+// ─── Express API endpoints (for your Netlify frontend) ─────────────────────
+app.get('/api/get-predictions', async (req, res) => {
+    const { fixture: fixtureId } = req.query;
+    try {
+        const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
+        if (snap.exists()) {
+            const match = (snap.data().matches || []).find(m => m.id === fixtureId);
+            if (match && match.manual_prediction) {
+                return res.json({
+                    response: [{
+                        predictions: {
+                            percent: {
+                                home: match.probabilities?.home ? match.probabilities.home + "%" : "—",
+                                draw: match.probabilities?.draw ? match.probabilities.draw + "%" : "—",
+                                away: match.probabilities?.away ? match.probabilities.away + "%" : "—"
+                            },
+                            advice: match.manual_prediction,
+                            code: match.manual_prediction.charAt(0)
+                        }
+                    }]
+                });
+            }
+        }
+        res.json({ response: [] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/scores', async (req, res) => {
+    try {
+        const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current'));
+        res.json(snap.exists() ? snap.data() : { matches: [] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.listen(port, '0.0.0.0', () => console.log(`Vision Dashboard live on ${port}`));
