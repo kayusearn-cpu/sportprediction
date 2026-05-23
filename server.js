@@ -51,21 +51,79 @@ if (process.env.OPENAI_API_KEY) {
     console.warn("⚠️ OPENAI_API_KEY is missing! Server will run, but Vision features will be disabled.");
 }
 
-// ─── StatPal API Integration ─────────────────────────────────────────────────
-const STATPAL_KEY = process.env.STATPAL_API_KEY || 'bcd42a3c-46ce-4dd2-aaae-320cf9d98f22';
-const MAJOR_LEAGUES = [8, 301, 384, 82, 564, 2, 3, 4, 693, 400, 462, 556, 1, 30];
+// ─── Football‑Data.org API Integration ──────────────────────────────────────
+const FD_API_KEY = process.env.FOOTBALL_DATA_API_KEY || '569ee80c4ec0495abe12a226d30394df';
+const FD_BASE = 'https://api.football-data.org/v4';
 
-async function fetchFromStatPal(endpoint, params = {}) {
+// Only top‑tier competitions available on free plan (IDs from football-data.org)
+const MAJOR_COMPETITIONS = [2021, 2014, 2002, 2019, 2015, 2001, 2003, 2016, 2017, 2018, 2020]; // PL, BL, BL1, SA, FL1, ELC, CL, etc.
+// Free plan includes: Premier League (2021), Bundesliga (2002), Serie A (2019), La Liga (2014), Ligue 1 (2015), Champions League (2001), etc.
+
+async function fetchFromFootballData(endpoint, params = {}) {
     try {
-        const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
-            params: { ...params, access_key: STATPAL_KEY },
-            timeout: 30000   // Increased timeout
+        const r = await axios.get(`${FD_BASE}/${endpoint}`, {
+            headers: { 'X-Auth-Token': FD_API_KEY },
+            params,
+            timeout: 30000
         });
         return r.data;
     } catch (error) {
-        console.error(`❌ StatPal Error [${endpoint}]:`, error.message);
+        if (error.response) {
+            console.error(`❌ Football‑Data Error [${endpoint}]: ${error.response.status} - ${error.response.statusText}`);
+            if (error.response.status === 429) {
+                console.warn('⚠️ Rate limit reached. Free tier allows 10 calls/min.');
+            }
+        } else {
+            console.error(`❌ Football‑Data Error [${endpoint}]: ${error.message}`);
+        }
         return null;
     }
+}
+
+// Convert football‑data.org match object → our internal match format
+function convertMatch(fdMatch, dateStr = null) {
+    const statusMap = {
+        'SCHEDULED': 'Upcoming',
+        'LIVE': 'Live',
+        'IN_PLAY': 'Live',
+        'PAUSED': 'Live',
+        'FINISHED': 'Past',
+        'AWARDED': 'Past',
+        'CANCELLED': 'Upcoming',
+        'POSTPONED': 'Upcoming',
+        'SUSPENDED': 'Live'
+    };
+
+    const utcDate = fdMatch.utcDate ? new Date(fdMatch.utcDate) : null;
+    const date = dateStr || (utcDate ? utcDate.toISOString().split('T')[0] : '');
+    const time = utcDate ? utcDate.toISOString().split('T')[1].substring(0,5) : '';
+
+    const homeName = fdMatch.homeTeam?.name || 'Home';
+    const awayName = fdMatch.awayTeam?.name || 'Away';
+    const homeGoals = fdMatch.score?.fullTime?.home !== null ? fdMatch.score.fullTime.home : null;
+    const awayGoals = fdMatch.score?.fullTime?.away !== null ? fdMatch.score.fullTime.away : null;
+
+    let playingTime = '';
+    if (fdMatch.status === 'IN_PLAY' || fdMatch.status === 'PAUSED') {
+        playingTime = fdMatch.minute ? `${fdMatch.minute}'` : 'Live';
+    } else if (fdMatch.status === 'FINISHED') {
+        playingTime = 'FT';
+    } else if (fdMatch.status === 'SCHEDULED' || fdMatch.status === 'POSTPONED') {
+        playingTime = fdMatch.status.toLowerCase();
+    }
+
+    return {
+        id: `fd_${fdMatch.id}`,
+        date,
+        time,
+        home: { name: homeName, goals: homeGoals },
+        away: { name: awayName, goals: awayGoals },
+        leagueName: fdMatch.competition?.name || 'Unknown League',
+        status: statusMap[fdMatch.status] || 'Upcoming',
+        playing_time: playingTime,
+        manual_prediction: '',
+        country: 'API Data'
+    };
 }
 
 // ─── Auto-Live Sync Logic ────────────────────────────────────────────────────
@@ -75,8 +133,9 @@ let isAutoLiveOn = false;
 async function syncLiveScores() {
     if (!db) return;
     try {
-        const data = await fetchFromStatPal('livescores');
-        if (!data || !data.livescore || !data.livescore.league) return;
+        // Fetch all LIVE and IN_PLAY matches (free plan covers top competitions)
+        const data = await fetchFromFootballData('matches', { status: 'LIVE' });
+        if (!data || !data.matches) return;
 
         const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
         const snap = await getDoc(docRef);
@@ -85,46 +144,31 @@ async function syncLiveScores() {
         let currentData = snap.data();
         let updated = false;
 
-        const leagues = Array.isArray(data.livescore.league) ? data.livescore.league : [data.livescore.league];
-        
-        leagues.forEach(l => {
-            const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
-            items.forEach(m => {
-                const idx = currentData.matches.findIndex(em => 
-                    (em.id === `api_${m.id}`) || 
-                    (em.home.name.toLowerCase() === m.home.name.toLowerCase() && em.away.name.toLowerCase() === m.away.name.toLowerCase())
-                );
+        data.matches.forEach(fdMatch => {
+            const idx = currentData.matches.findIndex(em => 
+                em.id === `fd_${fdMatch.id}` || 
+                (em.home.name.toLowerCase() === fdMatch.homeTeam?.name?.toLowerCase() &&
+                 em.away.name.toLowerCase() === fdMatch.awayTeam?.name?.toLowerCase())
+            );
 
-                if (idx !== -1) {
-                    const statusText = m.status || '';
-                    let hGoal = null, aGoal = null;
-                    if (m.score && m.score.includes('-')) {
-                        hGoal = m.score.split('-')[0].trim();
-                        aGoal = m.score.split('-')[1].trim();
-                    } else if (m.home?.goals !== undefined) {
-                        hGoal = m.home.goals;
-                        aGoal = m.away.goals;
-                    }
+            if (idx !== -1) {
+                const homeGoals = fdMatch.score?.fullTime?.home !== null ? fdMatch.score.fullTime.home : null;
+                const awayGoals = fdMatch.score?.fullTime?.away !== null ? fdMatch.score.fullTime.away : null;
+                currentData.matches[idx].home.goals = homeGoals;
+                currentData.matches[idx].away.goals = awayGoals;
 
-                    currentData.matches[idx].home.goals = hGoal;
-                    currentData.matches[idx].away.goals = aGoal;
-                    
-                    const isFin = ['FT', 'AET', 'PEN', 'Finished'].includes(statusText);
-                    const isUpc = ['NS', 'TBD', 'POSTP'].includes(statusText) || /^\d{2}:\d{2}$/.test(statusText);
-
-                    if (isFin) {
-                        currentData.matches[idx].status = 'Past';
-                        currentData.matches[idx].playing_time = 'FT';
-                    } else if (isUpc) {
-                        currentData.matches[idx].status = 'Upcoming';
-                        currentData.matches[idx].playing_time = statusText;
-                    } else {
-                        currentData.matches[idx].status = 'Live';
-                        currentData.matches[idx].playing_time = statusText;
-                    }
-                    updated = true;
+                let status = 'Live';
+                let playingTime = '';
+                if (fdMatch.status === 'IN_PLAY' || fdMatch.status === 'PAUSED') {
+                    playingTime = fdMatch.minute ? `${fdMatch.minute}'` : 'Live';
+                } else if (fdMatch.status === 'FINISHED') {
+                    status = 'Past';
+                    playingTime = 'FT';
                 }
-            });
+                currentData.matches[idx].status = status;
+                currentData.matches[idx].playing_time = playingTime;
+                updated = true;
+            }
         });
 
         if (updated) {
@@ -157,7 +201,7 @@ if (botToken) {
 
     bot.start((ctx) => {
         if (!checkAdmin(ctx)) return;
-        ctx.reply('⚽ *Magic AI Dashboard*\n\nTurn on **Auto-Live Sync** to automatically refresh match minutes and scores in real-time!', {
+        ctx.reply('⚽ *Magic AI Dashboard*\n\nNow using football‑data.org (free tier). Turn on **Auto-Live Sync** to refresh scores!', {
             parse_mode: 'Markdown',
             ...getMainMenu()
         });
@@ -168,7 +212,7 @@ if (botToken) {
         isAutoLiveOn = !isAutoLiveOn;
         
         if (isAutoLiveOn) {
-            ctx.reply("🚀 *Real-Time Live Sync Started!*\nI will check StatPal every 60 seconds.", { parse_mode: 'Markdown', ...getMainMenu() });
+            ctx.reply("🚀 *Real-Time Live Sync Started!*\nI will check football‑data.org every 60 seconds.", { parse_mode: 'Markdown', ...getMainMenu() });
             syncLiveScores();
             autoLiveInterval = setInterval(syncLiveScores, 60000);
         } else {
@@ -215,61 +259,25 @@ if (botToken) {
         if (!db) return ctx.reply('❌ Database not connected.');
 
         const day = ctx.match[1];
-        ctx.reply(`⏳ Fetching ${day}'s major matches from StatPal...`);
+        ctx.reply(`⏳ Fetching ${day}'s major matches from football‑data.org...`);
         
         const targetDate = new Date();
         if (day === 'Tomorrow') targetDate.setDate(targetDate.getDate() + 1);
         const dateStr = targetDate.toISOString().split('T')[0];
 
         try {
-            let data = await fetchFromStatPal('fixtures', { date: dateStr });
+            let data = await fetchFromFootballData('matches', { dateFrom: dateStr, dateTo: dateStr });
             if (!data) {
-                // Retry once after 2 seconds
                 ctx.reply('🔄 First attempt failed, retrying...');
                 await new Promise(r => setTimeout(r, 2000));
-                data = await fetchFromStatPal('fixtures', { date: dateStr });
+                data = await fetchFromFootballData('matches', { dateFrom: dateStr, dateTo: dateStr });
             }
-            if (!data) return ctx.reply('❌ Failed to fetch from API after 2 attempts. Check key limits or try again later.');
-            
-            const matchesToSave = [];
-            const leagues = data.livescore?.league || (Array.isArray(data.data) ? [{match: data.data}] : []);
-            
-            leagues.forEach(l => {
-                if (l.id && !MAJOR_LEAGUES.includes(Number(l.id))) return;
+            if (!data) return ctx.reply('❌ Failed to fetch from football‑data.org. Check key or rate limits.');
 
-                const items = Array.isArray(l.match) ? l.match : [l.match].filter(Boolean);
-                items.forEach(m => {
-                    const statusText = m.status || '';
-                    const isFin = ['FT', 'AET', 'PEN', 'Finished'].includes(statusText);
-                    const isUpc = ['NS', 'TBD', 'POSTP'].includes(statusText) || /^\d{2}:\d{2}$/.test(statusText);
-                    
-                    let computedStatus = "Upcoming";
-                    if (isFin) computedStatus = "Past";
-                    else if (!isUpc) computedStatus = "Live";
-
-                    let hGoal = null, aGoal = null;
-                    if (m.score && m.score.includes('-')) {
-                        hGoal = m.score.split('-')[0].trim();
-                        aGoal = m.score.split('-')[1].trim();
-                    } else if (m.home?.goals !== undefined) {
-                        hGoal = m.home.goals;
-                        aGoal = m.away.goals;
-                    }
-
-                    matchesToSave.push({
-                        id: `api_${m.id || Date.now()}`,
-                        date: dateStr,
-                        time: m.time || (isUpc ? statusText : ""),
-                        home: { name: m.home?.name || 'Home', goals: hGoal },
-                        away: { name: m.away?.name || 'Away', goals: aGoal },
-                        leagueName: l.name || "Major League",
-                        status: computedStatus,
-                        playing_time: computedStatus === "Live" ? statusText : (isFin ? "FT" : ""),
-                        manual_prediction: "",
-                        country: "API Data"
-                    });
-                });
-            });
+            // Filter to only major competitions (free tier already limits, but double-check)
+            const matchesToSave = data.matches
+                .filter(m => MAJOR_COMPETITIONS.includes(m.competition?.id))
+                .map(m => convertMatch(m, dateStr));
 
             if (matchesToSave.length === 0) return ctx.reply(`❌ No major matches found for ${day}.`);
 
@@ -278,9 +286,12 @@ if (botToken) {
             let currentData = snap.exists() ? snap.data() : { matches: [] };
 
             matchesToSave.forEach(newM => {
-                const idx = currentData.matches.findIndex(em => em.home.name === newM.home.name && em.away.name === newM.away.name);
+                const idx = currentData.matches.findIndex(em => 
+                    em.home.name === newM.home.name && em.away.name === newM.away.name
+                );
                 if (idx !== -1) {
-                    newM.manual_prediction = currentData.matches[idx].manual_prediction || "";
+                    // preserve manual prediction
+                    newM.manual_prediction = currentData.matches[idx].manual_prediction || '';
                     currentData.matches[idx] = newM;
                 } else {
                     currentData.matches.unshift(newM);
@@ -304,7 +315,7 @@ if (botToken) {
         userSession[ctx.from.id] = { replaceAllMode: true };
     });
 
-    // ── Vision Handling ──
+    // ── Vision Handling ── (unchanged)
     bot.on('photo', async (ctx) => {
         if (!checkAdmin(ctx)) return;
         if (!openai) return ctx.reply('❌ OpenAI API Key is missing on the server! Please add OPENAI_API_KEY to your Railway Variables.');
@@ -343,7 +354,7 @@ if (botToken) {
         } catch (e) { ctx.reply(`❌ Vision Scan Error: ${e.message}`); }
     });
 
-    // ✅ Text handler – passes unknown messages to other handlers
+    // ✅ Text handler
     bot.on('text', async (ctx, next) => {
         const session = userSession[ctx.from.id];
 
