@@ -26,7 +26,7 @@ const checkAdmin = (ctx) => {
     return false;
 };
 
-// ─── Firebase Initialization (WITH AUTHENTICATION) ───────────────────────────
+// ─── Firebase Initialization ─────────────────────────────────────────────────
 const firebaseConfigStr = process.env.FIREBASE_CONFIG;
 let db = null;
 if (firebaseConfigStr) {
@@ -37,7 +37,7 @@ if (firebaseConfigStr) {
         
         signInAnonymously(auth)
             .then(() => console.log("🔥 Firebase Authenticated Successfully."))
-            .catch(err => console.error("❌ Firebase Auth Error:", err.message));
+            .catch(err => console.warn("⚠️ Firebase Auth skipped (rules may still work):", err.message));
             
         console.log("🔥 Firebase Database connected.");
     } catch (err) { console.error("❌ Firebase Config Error:", err.message); }
@@ -59,7 +59,7 @@ async function fetchFromStatPal(endpoint, params = {}) {
     try {
         const r = await axios.get(`https://statpal.io/api/v1/soccer/${endpoint}`, {
             params: { ...params, access_key: STATPAL_KEY },
-            timeout: 15000
+            timeout: 30000   // Increased timeout
         });
         return r.data;
     } catch (error) {
@@ -222,8 +222,14 @@ if (botToken) {
         const dateStr = targetDate.toISOString().split('T')[0];
 
         try {
-            const data = await fetchFromStatPal('fixtures', { date: dateStr });
-            if (!data) return ctx.reply('❌ Failed to fetch from API. Check key limits.');
+            let data = await fetchFromStatPal('fixtures', { date: dateStr });
+            if (!data) {
+                // Retry once after 2 seconds
+                ctx.reply('🔄 First attempt failed, retrying...');
+                await new Promise(r => setTimeout(r, 2000));
+                data = await fetchFromStatPal('fixtures', { date: dateStr });
+            }
+            if (!data) return ctx.reply('❌ Failed to fetch from API after 2 attempts. Check key limits or try again later.');
             
             const matchesToSave = [];
             const leagues = data.livescore?.league || (Array.isArray(data.data) ? [{match: data.data}] : []);
@@ -337,11 +343,10 @@ if (botToken) {
         } catch (e) { ctx.reply(`❌ Vision Scan Error: ${e.message}`); }
     });
 
-    // ✅ FIXED text handler – passes unknown messages to other handlers
+    // ✅ Text handler – passes unknown messages to other handlers
     bot.on('text', async (ctx, next) => {
         const session = userSession[ctx.from.id];
 
-        // 1) Manual editing flow
         if (session && session.editing) {
             const val = ctx.message.text;
             if (!db) return ctx.reply('❌ Database not connected.');
@@ -376,7 +381,6 @@ if (botToken) {
             return;
         }
 
-        // 2) Confirmation / Wipe actions from screenshot flow
         if (session?.pendingMatches && ctx.message.text === '🚀 Confirm & Publish') {
             return publishMatches(ctx, false);
         }
@@ -384,7 +388,6 @@ if (botToken) {
             return publishMatches(ctx, true);
         }
 
-        // 3) Not a session action → let other handlers (Sync API, Clear All, etc.) process it
         return next();
     });
 
@@ -458,7 +461,7 @@ if (botToken) {
         .catch(err => console.error('🚨 Bot launch error:', err.message));
 }
 
-// ─── Express API endpoints (for your Netlify frontend) ─────────────────────
+// ─── Express API endpoints ──────────────────────────────────────────────────
 app.get('/api/get-predictions', async (req, res) => {
     const { fixture: fixtureId } = req.query;
     try {
