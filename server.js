@@ -55,10 +55,6 @@ if (process.env.OPENAI_API_KEY) {
 const FD_API_KEY = process.env.FOOTBALL_DATA_API_KEY || '569ee80c4ec0495abe12a226d30394df';
 const FD_BASE = 'https://api.football-data.org/v4';
 
-// Only top‑tier competitions available on free plan (IDs from football-data.org)
-const MAJOR_COMPETITIONS = [2021, 2014, 2002, 2019, 2015, 2001, 2003, 2016, 2017, 2018, 2020]; // PL, BL, BL1, SA, FL1, ELC, CL, etc.
-// Free plan includes: Premier League (2021), Bundesliga (2002), Serie A (2019), La Liga (2014), Ligue 1 (2015), Champions League (2001), etc.
-
 async function fetchFromFootballData(endpoint, params = {}) {
     try {
         const r = await axios.get(`${FD_BASE}/${endpoint}`, {
@@ -133,7 +129,6 @@ let isAutoLiveOn = false;
 async function syncLiveScores() {
     if (!db) return;
     try {
-        // Fetch all LIVE and IN_PLAY matches (free plan covers top competitions)
         const data = await fetchFromFootballData('matches', { status: 'LIVE' });
         if (!data || !data.matches) return;
 
@@ -254,12 +249,13 @@ if (botToken) {
         ctx.reply(p[ctx.match[1]]);
     });
 
+    // ✅ Sync API: Today / Tomorrow – uses ALL matches returned by the free plan
     bot.hears(/🔄 Sync API: (Today|Tomorrow)/, async (ctx) => {
         if (!checkAdmin(ctx)) return;
         if (!db) return ctx.reply('❌ Database not connected.');
 
         const day = ctx.match[1];
-        ctx.reply(`⏳ Fetching ${day}'s major matches from football‑data.org...`);
+        ctx.reply(`⏳ Fetching ${day}'s matches from football‑data.org...`);
         
         const targetDate = new Date();
         if (day === 'Tomorrow') targetDate.setDate(targetDate.getDate() + 1);
@@ -274,12 +270,10 @@ if (botToken) {
             }
             if (!data) return ctx.reply('❌ Failed to fetch from football‑data.org. Check key or rate limits.');
 
-            // Filter to only major competitions (free tier already limits, but double-check)
-            const matchesToSave = data.matches
-                .filter(m => MAJOR_COMPETITIONS.includes(m.competition?.id))
-                .map(m => convertMatch(m, dateStr));
+            // No competition filtering – the free plan already restricts to 12 competitions.
+            const matchesToSave = data.matches.map(m => convertMatch(m, dateStr));
 
-            if (matchesToSave.length === 0) return ctx.reply(`❌ No major matches found for ${day}.`);
+            if (matchesToSave.length === 0) return ctx.reply(`❌ No matches found for ${day}. Try a date with active games.`);
 
             const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'livescores', 'current');
             const snap = await getDoc(docRef);
@@ -290,7 +284,6 @@ if (botToken) {
                     em.home.name === newM.home.name && em.away.name === newM.away.name
                 );
                 if (idx !== -1) {
-                    // preserve manual prediction
                     newM.manual_prediction = currentData.matches[idx].manual_prediction || '';
                     currentData.matches[idx] = newM;
                 } else {
@@ -315,7 +308,7 @@ if (botToken) {
         userSession[ctx.from.id] = { replaceAllMode: true };
     });
 
-    // ── Vision Handling ── (unchanged)
+    // ── Vision Handling ──
     bot.on('photo', async (ctx) => {
         if (!checkAdmin(ctx)) return;
         if (!openai) return ctx.reply('❌ OpenAI API Key is missing on the server! Please add OPENAI_API_KEY to your Railway Variables.');
@@ -354,7 +347,7 @@ if (botToken) {
         } catch (e) { ctx.reply(`❌ Vision Scan Error: ${e.message}`); }
     });
 
-    // ✅ Text handler
+    // ✅ Text handler – passes unknown messages to other handlers
     bot.on('text', async (ctx, next) => {
         const session = userSession[ctx.from.id];
 
