@@ -53,7 +53,7 @@ function showMainMenu(chatId) {
 // ── HTTP helpers ─────────────────────────────────────────────────────────────
 function httpsGet(hostname, path, headers) {
     return new Promise((resolve, reject) => {
-        https.get({ hostname, path, headers: Object.assign({ 'User-Agent': 'MagicBot/1.0' }, headers || {}) }, res => {
+        https.get({ hostname, path, headers: Object.assign({ 'User-Agent': 'Mozilla/5.0' }, headers || {}) }, res => {
             let raw = '';
             res.on('data', c => raw += c);
             res.on('end', () => resolve(raw));
@@ -77,76 +77,121 @@ function httpsPostJson(hostname, path, body, headers) {
     });
 }
 
-// ── PURE HTTP SCRAPER (with detailed logs) ───────────────────────────────────
+// ── IMPROVED HTTP SCRAPER (with debug & correct patterns) ───────────────────
 async function scrapeForebetHttp() {
     console.log('[HTTP] Fetching Forebet HTML...');
     const html = await httpsGet('www.forebet.com', '/en/football-tips-and-predictions-for-today/predictions-1x2');
     console.log(`[HTTP] Received ${html.length} bytes`);
 
-    const rowPattern = /<div class='rcnt tr_\d+'>([\s\S]*?)(?=<div class='rcnt tr_\d+'>|$)/gi;
+    // Use the exact row class from your snippet: <div class='rcnt tr_0'> or tr_1
+    const rowPattern = /<div class='rcnt tr_\d+'>([\s\S]*?)(?=<div class='rcnt tr_\d+'>|<\/div>\s*<\/div>\s*$)/gi;
     const rows = html.match(rowPattern) || [];
     console.log(`[HTTP] Found ${rows.length} potential match rows`);
 
+    // Debug: log the first row (first 500 chars)
+    if (rows.length > 0) {
+        console.log('[HTTP] First row preview:', rows[0].substring(0, 500));
+    }
+
     const matches = [];
+
     for (const row of rows) {
+        // Home/away – your snippet uses <span class="homeTeam" ...>...<span itemprop="name">TEAM</span>
         const homeMatch = row.match(/<span class="homeTeam"[^>]*>[\s\S]*?<span itemprop="name">([^<]+)<\/span>/i);
         const awayMatch = row.match(/<span class="awayTeam"[^>]*>[\s\S]*?<span itemprop="name">([^<]+)<\/span>/i);
-        if (!homeMatch || !awayMatch) continue;
+        if (!homeMatch || !awayMatch) {
+            console.log('[HTTP] Skipping row - missing team names');
+            continue;
+        }
         const home = homeMatch[1].trim();
         const away = awayMatch[1].trim();
 
+        // Date/time
         const dateMatch = row.match(/<time itemprop="startDate" datetime="([^"]+)"/i);
-        const [date, time] = dateMatch ? dateMatch[1].split('T') : ['', ''];
+        const [date, time] = dateMatch ? dateMatch[1].split('T') : [new Date().toISOString().split('T')[0], ''];
 
+        // Probabilities – inside <div class='fprc'>
         const fprcBlock = row.match(/<div class='fprc'>([\s\S]*?)<\/div>/i);
-        const probSpans = fprcBlock ? fprcBlock[1].match(/<span[^>]*>(\d+)<\/span>/gi) : [];
-        const probs = probSpans ? probSpans.map(s => parseInt(s.match(/>(\d+)</)[1])) : [33,33,33];
-        const [probHome, probDraw, probAway] = probs.length >= 3 ? probs : [33,33,33];
+        let probs = [33, 33, 33];
+        if (fprcBlock) {
+            // The numbers are in <span> elements, but the class may be 'fpr' for the bold one
+            const spans = fprcBlock[1].match(/<span[^>]*>(\d+)<\/span>/gi);
+            if (spans && spans.length >= 3) {
+                probs = spans.map(s => parseInt(s.match(/>(\d+)</)[1]));
+            }
+        }
+        const [probHome, probDraw, probAway] = probs.length === 3 ? probs : [33, 33, 33];
 
+        // Prediction: <span class="forepr"><span>1</span></span>
         const predMatch = row.match(/<span class="forepr">\s*<span>([12Xx])<\/span>/i);
         const prediction = predMatch ? predMatch[1].toUpperCase() : '';
 
-        const scoreMatch = row.match(/<div class="ex_sc tabonly">\s*([\d\s\-–]+)\s*<\/div>/i);
+        // Correct score: <div class="ex_sc tabonly">0 - 1</div> OR <div class="ex_sc">0 - 1</div>
+        const scoreMatch = row.match(/<div class="ex_sc(?:\s+tabonly)?">\s*([\d\s\-–]+)\s*<\/div>/i);
         const score = scoreMatch ? scoreMatch[1].trim().replace(/\s+/g, '') : '';
 
-        matches.push({ home, away, date: date || new Date().toISOString().split('T')[0], time, prediction, score, probHome, probDraw, probAway });
+        matches.push({
+            home, away, date, time, prediction, score,
+            probHome, probDraw, probAway,
+        });
     }
+
     console.log(`[HTTP] Successfully extracted ${matches.length} matches`);
     return matches;
 }
 
-// ── BROWSERLESS FALLBACK ─────────────────────────────────────────────────────
+// ── BROWSERLESS FALLBACK (improved) ──────────────────────────────────────────
 async function scrapeForebetBrowserless() {
     if (!BROWSERLESS_KEY) { console.warn('[Browserless] No token – skipped'); return []; }
     console.log('[Browserless] Launching headless browser...');
     const payload = {
         url: 'https://www.forebet.com/en/football-tips-and-predictions-for-today/predictions-1x2',
-        elements: [{ selector: '.rcnt' }],   // grab all match containers
-        gotoOptions: { waitUntil: 'networkidle0', timeout: 30000 }
+        elements: [{ selector: '.rcnt' }],   // all match containers
+        gotoOptions: { waitUntil: 'networkidle0', timeout: 30000 },
     };
     try {
         const result = await httpsPostJson('chrome.browserless.io', `/scrape?token=${BROWSERLESS_KEY}`, payload);
         const containers = result?.data?.[0]?.results || [];
         const matches = [];
+
         for (const c of containers) {
-            const home = c.querySelector('.homeTeam span')?.textContent?.trim() || '';
-            const away = c.querySelector('.awayTeam span')?.textContent?.trim() || '';
+            // Use textContent from the container's sub-elements (Browserless returns a DOM-like object)
+            const getText = (selector) => {
+                const el = c.querySelector(selector);
+                return el ? (el.textContent || el.innerText || '').trim() : '';
+            };
+
+            // Teams: .homeTeam span.itemprop="name" or just .homeTeam span
+            let home = getText('.homeTeam span[itemprop="name"]');
+            let away = getText('.awayTeam span[itemprop="name"]');
+            if (!home || !away) {
+                // fallback to just any span inside
+                home = getText('.homeTeam span');
+                away = getText('.awayTeam span');
+            }
             if (!home || !away) continue;
-            const predEl = c.querySelector('.forepr span');
-            const prediction = predEl ? predEl.textContent.trim() : '';
-            const scoreEl = c.querySelector('.ex_sc');
-            const score = scoreEl ? scoreEl.textContent.trim().replace(/\s/g, '') : '';
-            const probEls = c.querySelectorAll('.fprc span');
-            const probs = [...probEls].map(el => parseInt(el.textContent) || 0);
+
+            const prediction = getText('.forepr span');
+            const score = getText('.ex_sc').replace(/\s/g, '');  // remove spaces
+
+            // Probabilities: .fprc span – get all numbers
+            const probSpans = c.querySelectorAll('.fprc span');
+            const probs = [];
+            for (const s of probSpans) {
+                const t = (s.textContent || '').trim();
+                if (/^\d+$/.test(t)) probs.push(parseInt(t));
+            }
+            const probHome = probs[0] || 33;
+            const probDraw = probs[1] || 33;
+            const probAway = probs[2] || 33;
+
             matches.push({
                 home, away,
                 date: new Date().toISOString().split('T')[0],
                 time: '',
                 prediction,
                 score,
-                probHome: probs[0] || 33,
-                probDraw: probs[1] || 33,
-                probAway: probs[2] || 33,
+                probHome, probDraw, probAway,
             });
         }
         console.log(`[Browserless] Extracted ${matches.length} matches`);
@@ -157,12 +202,44 @@ async function scrapeForebetBrowserless() {
     }
 }
 
-// ── MAIN SCRAPE FUNCTION (HTTP first, then Browserless) ─────────────────────
+// ── FINAL FALLBACK: Try to find JSON in the page (if embedded) ─────────────
+async function scrapeForebetJsonFallback() {
+    console.log('[JSON fallback] Attempting to find embedded JSON...');
+    const html = await httpsGet('www.forebet.com', '/en/football-tips-and-predictions-for-today/predictions-1x2');
+    // Look for window.__INITIAL_STATE__ or a large JSON array
+    const jsonMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({.*?});/s);
+    if (!jsonMatch) return [];
+    try {
+        const data = JSON.parse(jsonMatch[1]);
+        const matchesList = data.matches || data.predictions || data.items || [];
+        if (!Array.isArray(matchesList)) return [];
+        return matchesList.map(m => ({
+            home: m.homeTeam || m.home?.name || '',
+            away: m.awayTeam || m.away?.name || '',
+            date: m.date || new Date().toISOString().split('T')[0],
+            time: m.time || '',
+            prediction: m.prediction || '',
+            score: m.correctScore || m.score || '',
+            probHome: m.probHome || m.probabilities?.home || 33,
+            probDraw: m.probDraw || m.probabilities?.draw || 33,
+            probAway: m.probAway || m.probabilities?.away || 33,
+        }));
+    } catch (e) {
+        console.error('[JSON fallback] Failed:', e.message);
+        return [];
+    }
+}
+
+// ── MAIN SCRAPE (HTTP → Browserless → JSON fallback) ────────────────────────
 async function scrapeForebet() {
     let matches = await scrapeForebetHttp();
     if (!matches.length) {
-        console.log('[Scraper] HTTP yielded 0 matches – falling back to Browserless');
+        console.log('[Scraper] HTTP returned 0 matches, trying Browserless...');
         matches = await scrapeForebetBrowserless();
+    }
+    if (!matches.length) {
+        console.log('[Scraper] Browserless returned 0 matches, trying JSON fallback...');
+        matches = await scrapeForebetJsonFallback();
     }
     return matches;
 }
@@ -192,22 +269,20 @@ async function syncForebetToStore() {
     console.log(`[Sync] Store updated with ${matches.length} matches`);
 }
 
-// ── Bot handlers (unchanged, just keep your existing ones) ──────────────────
-// (Include all your previous handler functions here – they are identical to the last full code I sent, minus the scraper part)
-// For brevity I'm omitting them – you already have them. Just copy from the previous full server.js.
-// ── BUT ensure the btn_sync callback calls syncForebetToStore() and not the old sync function.
-
-// ... [paste your existing handlers: showPreview, showEditList, handleStateInput, handleCallbackQuery, etc.] ...
+// ── Bot handlers (unchanged from earlier full code) ─────────────────────────
+// (Insert your existing showPreview, showEditList, handleStateInput, handleCallbackQuery, etc. here)
+// For brevity, I'm not repeating them – they are identical to the previous full server.js you have.
+// Just copy the ones you already have.
 
 // ── Polling loop (unchanged) ────────────────────────────────────────────────
 let offset = 0;
-async function pollTelegram() { /* your existing polling code */ }
+async function pollTelegram() { /* your existing code */ }
 
 // ── Frontend endpoints (unchanged) ──────────────────────────────────────────
-app.get('/api/scores', (req, res) => { /* your existing code */ });
-app.get('/api/get-predictions', (req, res) => { /* your existing code */ });
+app.get('/api/scores', (req, res) => { /* existing */ });
+app.get('/api/get-predictions', (req, res) => { /* existing */ });
 
-// ── Start server, polling, and periodic scraping ────────────────────────────
+// ── Start ──────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`⚽ Magic Analysis Bot live on port ${PORT}`);
     pollTelegram();
