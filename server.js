@@ -118,7 +118,7 @@ function httpsPostJson(hostname, path, body, headers) {
     });
 }
 
-// ── Sync API: Today ───────────────────────────────────────────────────────────
+// ── Sync API: Today (with AI predictions matching screenshot format) ─────────
 async function syncTodayMatches(chatId) {
     const today = new Date().toISOString().split('T')[0];
     let converted = [];
@@ -189,7 +189,7 @@ async function syncTodayMatches(chatId) {
 
     reply(chatId, `📥 Found <b>${converted.length}</b> match(es).${OPENAI_KEY ? '\n🧠 Generating AI predictions...' : ''}`);
 
-    // ── OpenAI auto-prediction (with predicted scores) ────────────────────────
+    // ── OpenAI auto‑prediction (with predicted scores) ────────────────────────
     if (OPENAI_KEY && converted.length > 0) {
         try {
             const matchList = converted.map((m, i) =>
@@ -234,11 +234,14 @@ async function syncTodayMatches(chatId) {
                 if (idx < converted.length) {
                     const tip    = pred.prediction || '';
                     const pScore = pred.pScore     || '';
-                    // Format exactly as screenshot upload: "prediction (pScore)", e.g. "1 (2-1)"
+                    // 👇 EXACT SAME FORMAT AS SCREENSHOT UPLOAD
                     converted[idx].manual_prediction = `${tip} (${pScore})`.trim();
+
+                    // Probabilities – ensure they sum to 100
                     const h = Math.round(Number(pred.probabilityHome) || 33);
                     const d = Math.round(Number(pred.probabilityDraw) || 33);
                     const a = 100 - h - d;
+
                     const k = matchKey(converted[idx].home.name, converted[idx].away.name);
                     store.preds[k] = {
                         h, d, a,
@@ -256,7 +259,7 @@ async function syncTodayMatches(chatId) {
         }
     }
 
-    // Store all matches
+    // Save all matches into the in‑memory store (same format as manual upload)
     for (const m of converted) {
         const k = matchKey(m.home.name, m.away.name);
         store.matches[k] = {
@@ -359,6 +362,7 @@ function handleStateInput(chatId, text, state) {
         return;
     }
 
+    // ... (the rest of the input handlers remain unchanged, but I include them for completeness)
     if (state.step === 'upcoming_input') {
         const [home, away, league, country, time, hp, dp, ap, score, advice, protip] = args;
         if (!home || !away) { reply(chatId, '❌ Minimum required: Home | Away'); return; }
@@ -451,3 +455,142 @@ function handleCallbackQuery(cq) {
             'Type in this format:',
             '<code>Home | Away | HomeGoals | AwayGoals | Minute</code>',
             '',
+            'Example: <code>Arsenal | Chelsea | 2 | 1 | 65</code>',
+        ].join('\n'), [[{ text: '❌ Cancel', callback_data: 'back_main' }]]);
+    }
+    else if (data === 'btn_finished') {
+        setState(chatId, 'finished_input');
+        replyKb(chatId, [
+            '✅ <b>Add Finished Match</b>',
+            '',
+            'Type in this format:',
+            '<code>Home | Away | HomeGoals | AwayGoals</code>',
+            '',
+            'Example: <code>Arsenal | Chelsea | 2 | 1</code>',
+        ].join('\n'), [[{ text: '❌ Cancel', callback_data: 'back_main' }]]);
+    }
+    else if (data === 'btn_upcoming') {
+        setState(chatId, 'upcoming_input');
+        replyKb(chatId, [
+            '🔵 <b>Add Upcoming Match</b>',
+            '',
+            'Type in this format:',
+            '<code>Home | Away | League | Country | Time | H% | D% | A% | Score | Advice | ProTip</code>',
+            '',
+            'Fields after Away are optional.',
+            'Example: <code>Real Madrid | Barcelona | LaLiga | Spain | 20:00 | 40 | 30 | 30 | 2-1 | Home Win | 1 (2-1)</code>',
+        ].join('\n'), [[{ text: '❌ Cancel', callback_data: 'back_main' }]]);
+    }
+    else if (data === 'btn_sync') {
+        syncTodayMatches(chatId);
+    }
+    else if (data === 'btn_preview') {
+        showPreview(chatId);
+    }
+    else if (data === 'btn_edit') {
+        showEditList(chatId);
+    }
+    else if (data.startsWith('edit_sel_')) {
+        const key = data.replace('edit_sel_', '');
+        if (store.matches[key]) {
+            setState(chatId, 'edit_input', { key });
+            replyKb(chatId, [
+                '✏️ <b>Edit Match</b>',
+                '',
+                'Type updated values (leave blank to keep current):',
+                '<code>Home | Away | League | Country | Time | H% | D% | A% | Score | Advice | ProTip</code>',
+            ].join('\n'), [[{ text: '❌ Cancel', callback_data: 'back_main' }]]);
+        }
+    }
+    else if (data.startsWith('del_')) {
+        const key = data.replace('del_', '');
+        delete store.matches[key];
+        delete store.preds[key];
+        reply(chatId, '🗑️ Match deleted.');
+        showMainMenu(chatId);
+    }
+    else if (data === 'back_main') {
+        clearState(chatId);
+        showMainMenu(chatId);
+    }
+}
+
+// ── Polling loop ──────────────────────────────────────────────────────────────
+let offset = 0;
+async function pollTelegram() {
+    if (!TG_TOKEN) return;
+    try {
+        const result = await httpsGet(
+            'api.telegram.org',
+            `/bot${TG_TOKEN}/getUpdates?offset=${offset}&timeout=30`
+        );
+        if (result && result.ok) {
+            for (const update of result.result) {
+                offset = update.update_id + 1;
+                if (update.message) {
+                    const chatId = update.message.chat.id;
+                    const text   = update.message.text || '';
+                    if (text === '/start') {
+                        showMainMenu(chatId);
+                    } else {
+                        const state = getState(chatId);
+                        if (state) {
+                            handleStateInput(chatId, text, state);
+                        } else {
+                            reply(chatId, 'Press a button from the menu below.');
+                            showMainMenu(chatId);
+                        }
+                    }
+                } else if (update.callback_query) {
+                    handleCallbackQuery(update.callback_query);
+                }
+            }
+        }
+    } catch (e) { /* ignore network errors */ }
+    pollTelegram();
+}
+
+// ── Frontend API endpoints (your Netlify site reads these) ───────────────────
+app.get('/api/scores', (req, res) => {
+    // Convert store to array of matches, attach predictions
+    const matches = Object.entries(store.matches).map(([key, m]) => {
+        const pred = store.preds[key];
+        return {
+            ...m,
+            probabilities: pred ? {
+                home: pred.h + '%',
+                draw: pred.d + '%',
+                away: pred.a + '%',
+            } : null,
+            // Also expose the exact manual_prediction string
+        };
+    });
+    res.json({ matches });
+});
+
+app.get('/api/get-predictions', (req, res) => {
+    const { fixture } = req.query;  // fixture = match key (e.g. "arsenal|chelsea")
+    if (!fixture) return res.json({ response: [] });
+    const pred = store.preds[fixture];
+    const match = store.matches[fixture];
+    if (!match || !pred) return res.json({ response: [] });
+    res.json({
+        response: [{
+            predictions: {
+                percent: {
+                    home: pred.h + '%',
+                    draw: pred.d + '%',
+                    away: pred.a + '%',
+                },
+                advice: pred.advice,
+                code:   pred.advice?.includes('Home') ? '1' : pred.advice?.includes('Away') ? '2' : 'X',
+            }
+        }]
+    });
+});
+
+// ── Start server and polling ─────────────────────────────────────────────────
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`⚽ Magic Analysis Bot live on port ${PORT}`);
+    pollTelegram();
+});
