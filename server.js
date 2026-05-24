@@ -7,11 +7,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT            = process.env.PORT               || 3000;
-const TG_TOKEN        = process.env.TELEGRAM_BOT_TOKEN  || '';
-const ADMIN_ID        = process.env.TELEGRAM_ADMIN_ID   || '';
-const BROWSERLESS_KEY = process.env.BROWSERLESS_TOKEN   || '';   // your Browserless.io token
-const OPENAI_KEY      = process.env.OPENAI_API_KEY      || '';   // keep if you still use screenshots
+const PORT        = process.env.PORT               || 3000;
+const TG_TOKEN    = process.env.TELEGRAM_BOT_TOKEN  || '';
+const ADMIN_ID    = process.env.TELEGRAM_ADMIN_ID   || '';
+const OPENAI_KEY  = process.env.OPENAI_API_KEY      || '';   // optional, if you still want screenshots
 
 // ── In‑memory store ───────────────────────────────────────────────────────────
 let store = { matches: {}, preds: {} };
@@ -62,7 +61,7 @@ const MAIN_KB = [
         { text: '👁  Preview',         callback_data: 'btn_preview'  },
     ],
     [
-        { text: '🔄  Scrape Forebet',  callback_data: 'btn_sync'     },   // changed label
+        { text: '🔄  Scrape Forebet',  callback_data: 'btn_sync'     },
         { text: '✏️  Edit / Delete',   callback_data: 'btn_edit'     },
     ],
 ];
@@ -85,8 +84,8 @@ function httpsGet(hostname, path, headers) {
             let raw = '';
             res.on('data', c => { raw += c; });
             res.on('end', () => {
-                try { resolve(JSON.parse(raw)); }
-                catch (e) { reject(new Error('httpsGet JSON parse error')); }
+                try { resolve(raw); }   // return raw HTML, not JSON
+                catch (e) { reject(new Error('httpsGet failed')); }
             });
         });
         req.on('error', reject);
@@ -94,100 +93,75 @@ function httpsGet(hostname, path, headers) {
     });
 }
 
-function httpsPostJson(hostname, path, body, headers) {
-    const bodyStr = JSON.stringify(body);
-    return new Promise((resolve, reject) => {
-        const req = https.request({
-            hostname, path, method: 'POST',
-            headers: Object.assign({
-                'Content-Type':   'application/json',
-                'Content-Length': Buffer.byteLength(bodyStr),
-            }, headers || {}),
-        }, res => {
-            let raw = '';
-            res.on('data', c => { raw += c; });
-            res.on('end', () => {
-                try { resolve(JSON.parse(raw)); }
-                catch (e) { reject(new Error('httpsPostJson JSON parse error')); }
-            });
-        });
-        req.on('error', reject);
-        req.write(bodyStr);
-        req.end();
-    });
-}
-
-// ── SCRAPING: Forebet predictions via Browserless.io ────────────────────────
-async function scrapeForebet() {
-    if (!BROWSERLESS_KEY) {
-        console.warn('⚠️ BROWSERLESS_TOKEN missing – cannot scrape');
-        return [];
-    }
-
-    const url = 'https://www.forebet.com/en/football-tips-and-predictions-for-today/predictions-1x2';
-    const payload = {
-        url,
-        elements: [
-            { selector: 'table.rcnt tbody tr' }    // ← VERIFY THIS SELECTOR on the live page!
-        ],
-        gotoOptions: {
-            waitUntil: 'networkidle0',
-            timeout: 30000,
-        },
-    };
-
+// ── PURE HTTP FOREBET SCRAPER (no browser, no CSS) ─────────────────────────
+async function scrapeForebetViaHttp() {
     try {
-        const result = await httpsPostJson(
-            'chrome.browserless.io',
-            `/scrape?token=${BROWSERLESS_KEY}`,
-            payload
+        const html = await httpsGet(
+            'www.forebet.com',
+            '/en/football-tips-and-predictions-for-today/predictions-1x2'
         );
 
-        const results = result?.data?.[0]?.results || [];
+        // Split into individual match rows
+        const rowPattern = /<div class='rcnt tr_\d+'>([\s\S]*?)(?=<div class='rcnt tr_\d+'>|$)/gi;
+        const rows = html.match(rowPattern) || [];
+
         const matches = [];
 
-        for (const row of results) {
-            // Helper to safely extract text from a sub‑selector
-            const extract = (selector) => {
-                const el = row.querySelector(selector);
-                return el ? el.textContent.trim() : '';
-            };
+        for (const row of rows) {
+            // 1. Home & away teams
+            const homeMatch = row.match(/<span class="homeTeam"[^>]*>[\s\S]*?<span itemprop="name">([^<]+)<\/span>/i);
+            const awayMatch = row.match(/<span class="awayTeam"[^>]*>[\s\S]*?<span itemprop="name">([^<]+)<\/span>/i);
+            if (!homeMatch || !awayMatch) continue;
 
-            const home      = extract('td.homeTeam');
-            const away      = extract('td.awayTeam');
-            const prediction = extract('td.fprc');
-            const score     = extract('td.ex_sc');
+            const home = homeMatch[1].trim();
+            const away = awayMatch[1].trim();
 
-            // Probabilities: three td.prob elements
-            const probTds = row.querySelectorAll('td.prob');
-            const probHome  = probTds[0]?.textContent?.trim().replace('%', '') || '';
-            const probDraw  = probTds[1]?.textContent?.trim().replace('%', '') || '';
-            const probAway  = probTds[2]?.textContent?.trim().replace('%', '') || '';
+            // 2. Date & time
+            const dateMatch = row.match(/<time itemprop="startDate" datetime="([^"]+)"/i);
+            const dateTime = dateMatch ? dateMatch[1] : '';
+            const [date, time] = dateTime ? dateTime.split('T') : ['', ''];
 
-            if (home && away) {
-                matches.push({
-                    home,
-                    away,
-                    prediction,       // "1", "X", "2"
-                    score,            // "2-1"
-                    probHome: parseFloat(probHome) || 33,
-                    probDraw: parseFloat(probDraw) || 33,
-                    probAway: parseFloat(probAway) || 33,
-                });
-            }
+            // 3. Probabilities (inside <div class='fprc'>)
+            const fprcBlock = row.match(/<div class='fprc'>([\s\S]*?)<\/div>/i);
+            const probSpans = fprcBlock ? fprcBlock[1].match(/<span[^>]*>(\d+)<\/span>/gi) : [];
+            const probs = probSpans
+                ? probSpans.map(s => parseInt(s.match(/>(\d+)</)[1]))
+                : [33, 33, 33];
+            const [probHome, probDraw, probAway] = probs.length >= 3 ? probs : [33, 33, 33];
+
+            // 4. Prediction (1 / X / 2)
+            const predMatch = row.match(/<span class="forepr">\s*<span>([12Xx])<\/span>/i);
+            const prediction = predMatch ? predMatch[1].toUpperCase() : '';
+
+            // 5. Correct score
+            const scoreMatch = row.match(/<div class="ex_sc tabonly">\s*([\d\s\-–]+)\s*<\/div>/i);
+            const scoreRaw = scoreMatch ? scoreMatch[1].trim() : '';
+            const score = scoreRaw.replace(/\s+/g, '');  // "0 - 1" → "0-1"
+
+            matches.push({
+                home,
+                away,
+                date: date || new Date().toISOString().split('T')[0],
+                time: time || '',
+                prediction,
+                score,
+                probHome: probHome || 33,
+                probDraw: probDraw || 33,
+                probAway: probAway || 33,
+            });
         }
 
-        console.log(`✅ Scraped ${matches.length} predictions from Forebet`);
+        console.log(`✅ HTTP scrape: ${matches.length} matches`);
         return matches;
     } catch (err) {
-        console.error('❌ Forebet scrape failed:', err.message);
+        console.error('HTTP scrape failed:', err.message);
         return [];
     }
 }
 
 // ── Update store with scraped data ─────────────────────────────────────────
 async function syncForebetToStore() {
-    const matches = await scrapeForebet();
+    const matches = await scrapeForebetViaHttp();
     if (!matches.length) return;
 
     const today = new Date().toISOString().split('T')[0];
@@ -198,11 +172,11 @@ async function syncForebetToStore() {
             id:                k,
             home:              { name: m.home, score: null },
             away:              { name: m.away, score: null },
-            leagueName:        '',          // Forebet's 1X2 view doesn't show league inline – you can leave blank
+            leagueName:        '',          // not scraped (optional)
             country:           '',
-            time:              '',
+            time:              m.time,
             status:            'NS',
-            manual_prediction: `${m.prediction} (${m.score})`,    // ex: "1 (2-1)"
+            manual_prediction: `${m.prediction} (${m.score})`,   // "1 (2-1)"
         };
         store.preds[k] = {
             h:          Math.round(m.probHome),
@@ -458,10 +432,21 @@ let offset = 0;
 async function pollTelegram() {
     if (!TG_TOKEN) return;
     try {
-        const result = await httpsGet(
-            'api.telegram.org',
-            `/bot${TG_TOKEN}/getUpdates?offset=${offset}&timeout=30`
-        );
+        const result = await new Promise((resolve, reject) => {
+            https.get({
+                hostname: 'api.telegram.org',
+                path: `/bot${TG_TOKEN}/getUpdates?offset=${offset}&timeout=30`,
+                headers: { 'User-Agent': 'MagicBot/1.0' },
+            }, res => {
+                let raw = '';
+                res.on('data', c => { raw += c; });
+                res.on('end', () => {
+                    try { resolve(JSON.parse(raw)); }
+                    catch (e) { reject(e); }
+                });
+            }).on('error', reject);
+        });
+
         if (result && result.ok) {
             for (const update of result.result) {
                 offset = update.update_id + 1;
@@ -470,17 +455,6 @@ async function pollTelegram() {
                     const text   = update.message.text || '';
                     if (text === '/start') {
                         showMainMenu(chatId);
-                    } else if (update.message.photo) {
-                        // ── Keep screenshot handler if you still want it (uses OpenAI) ──
-                        if (!OPENAI_KEY) {
-                            reply(chatId, '❌ OpenAI API key not set. Cannot process screenshots.');
-                            continue;
-                        }
-                        const photo = update.message.photo[update.message.photo.length - 1];
-                        // ... (rest of photo handler unchanged)
-                        // (For brevity, I'm omitting the full photo‑processing logic; if you still need screenshots, let me know and I'll include the full handler)
-                        // For now, reply that screenshots are disabled.
-                        reply(chatId, '📸 Screenshot processing is currently disabled. Use 🔄 Scrape Forebet instead.');
                     } else {
                         const state = getState(chatId);
                         if (state) {
@@ -499,7 +473,7 @@ async function pollTelegram() {
     pollTelegram();
 }
 
-// ── Frontend API endpoints (unchanged from before) ──────────────────────────
+// ── Frontend API endpoints ──────────────────────────────────────────────────
 app.get('/api/scores', (req, res) => {
     const matches = Object.entries(store.matches).map(([key, m]) => {
         const pred = store.preds[key];
