@@ -1,16 +1,14 @@
-import json
-import sys
-import asyncio
+import json, sys, asyncio
 from crawl4ai import AsyncWebCrawler
 
 async def fetch(url, selector=None, proxy=None):
     async with AsyncWebCrawler(verbose=False) as crawler:
         kwargs = {}
         if proxy:
-            kwargs["proxy"] = proxy  # "http://user:pass@host:port"
+            kwargs["proxy"] = proxy  # e.g. "http://user:pass@host:port"
         result = await crawler.arun(
             url=url,
-            js_code="window.scrollBy(0, 500)",  # trigger lazy content
+            js_code="window.scrollBy(0, 500)",  # trigger lazy images
             bypass_cache=True,
             **kwargs
         )
@@ -18,8 +16,7 @@ async def fetch(url, selector=None, proxy=None):
             raise Exception(f"Crawl failed: {result.error_message}")
 
         if selector:
-            # Extract text from each element matching selector
-            elements = result.html.css.select(selector)  # BeautifulSoup
+            elements = result.html.css.select(selector)
             items = [el.get_text(strip=True) for el in elements]
             return {"elements": items, "full_html": result.html.html}
         return {"html": result.html.html}
