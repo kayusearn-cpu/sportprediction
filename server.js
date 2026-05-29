@@ -96,6 +96,24 @@ async function fetchPageHTML() {
   return text;
 }
 
+// Strip scripts/styles/markup so the model sees real content, not 600KB of noise.
+function htmlToText(html) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+    .replace(/<head[\s\S]*?<\/head>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<\/(div|p|li|tr|table|section|article|h[1-6])>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
 // Step 2: turn raw HTML into structured predictions using OpenAI.
 async function extractPredictions(html) {
   if (!OPENAI_KEY) throw new Error('OPENAI_API_KEY not set');
@@ -116,15 +134,17 @@ Each match object must have these keys (use empty string "" when unknown):
 - "probAway"      integer 0-100
 - "advice"        short tip text e.g. "Home Win" or "Over 2.5"
 Only include real matches found in the HTML. Never invent data.`;
+  let userText = htmlToText(html);
+  if (userText.length < 500) userText = html; // fallback if stripping was too aggressive
   const body = {
     model: OPENAI_MODEL,
     messages: [
       { role: 'system', content: sys },
-      { role: 'user', content: html.slice(0, 80000) }, // keep token cost/latency bounded
+      { role: 'user', content: userText.slice(0, 100000) }, // cleaned text, budget-bounded
     ],
     response_format: { type: 'json_object' },
     temperature: 0.1,
-    max_tokens: 3000,
+    max_tokens: 4000,
   };
   const { status: code, text } = await httpRequest('POST', 'https://api.openai.com/v1/chat/completions', {
     headers: { Authorization: `Bearer ${OPENAI_KEY}` },
