@@ -12,6 +12,8 @@
  *   PORT                 web port (Railway sets this automatically)
  *   REFRESH_MINUTES      how often to re-scrape (default 20)
  *   TARGET_URL           the predictions page to scrape
+ *   ONLY_WITH_ODDS       "true" (default) = only show matches that have real odds/full
+ *                        data (the top matches); "false" = show every match
  *   BROWSERLESS_TOKEN    required - your browserless.io API token
  *   BROWSERLESS_HOST     browserless host (default chrome.browserless.io)
  *   BROWSERLESS_PROXY    optional - set to "residential" to use Browserless's proxy
@@ -30,6 +32,7 @@ const { URL } = require('url');
 const PORT = process.env.PORT || 3000;
 const REFRESH_MINUTES = parseInt(process.env.REFRESH_MINUTES || '20', 10);
 const TARGET_URL = process.env.TARGET_URL || 'https://www.pitchpredictions.com';
+const ONLY_WITH_ODDS = (process.env.ONLY_WITH_ODDS || 'true').toLowerCase() !== 'false';
 
 const BROWSERLESS_HOST = process.env.BROWSERLESS_HOST || 'chrome.browserless.io';
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '';
@@ -115,9 +118,26 @@ function htmlToText(html) {
 }
 
 // Step 2a: pitchpredictions.com is a Next.js site that ships ALL matches as JSON
-// inside a __NEXT_DATA__ script tag. Parsing it returns every match with exact
-// fields (teams, date/time, live score, status, prediction %) - no AI, no cost.
-function predFromPercents(h, d, a) {
+// inside a __NEXT_DATA__ script tag. We derive predictions from the betting markets
+// it provides (odds), which is exactly how the site itself computes them.
+function maybeJson(s) {
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    return null;
+  }
+}
+// 1X2 probabilities implied by decimal odds (the accurate, bookmaker-based method).
+function impliedPct(homeOdd, drawOdd, awayOdd) {
+  const inv = [homeOdd, drawOdd, awayOdd].map((o) => {
+    const n = parseFloat(o);
+    return n > 0 ? 1 / n : 0;
+  });
+  const sum = inv.reduce((a, b) => a + b, 0);
+  if (sum <= 0) return [0, 0, 0];
+  return inv.map((x) => Math.round((x / sum) * 100));
+}
+function predFrom(h, d, a) {
   const max = Math.max(h, d, a);
   if (max <= 0) return '';
   return max === h ? '1' : max === a ? '2' : 'X';
@@ -128,6 +148,35 @@ function normStatus(r) {
   if (['FT', 'AET', 'PEN'].includes(s)) return 'FT';
   if (s) return 'LIVE';
   return r.goals_home != null ? 'LIVE' : 'NS';
+}
+// Most likely scoreline: lowest-odds entry that matches the predicted 1X2 result.
+function bestCorrectScore(dcgRaw, pred) {
+  const arr = maybeJson(dcgRaw) || [];
+  let best = null;
+  let any = null;
+  for (const it of arr) {
+    const mm = String(it.value || '').match(/(\d+)\s*:\s*(\d+)/);
+    if (!mm) continue;
+    const hs = +mm[1];
+    const as = +mm[2];
+    const odd = parseFloat(it.odd);
+    if (!(odd > 0)) continue;
+    const outcome = hs > as ? '1' : hs < as ? '2' : 'X';
+    if (!any || odd < any.odd) any = { odd, s: `${hs}-${as}` };
+    if (pred && outcome === pred && (!best || odd < best.odd)) best = { odd, s: `${hs}-${as}` };
+  }
+  return best || any ? (best || any).s : '';
+}
+// Over/Under tip for the match's main line (lower odds = the pick).
+function overUnderTip(gouRaw, line) {
+  const arr = maybeJson(gouRaw) || [];
+  const ln = line || '2.5';
+  const ov = arr.find((x) => new RegExp('Over\\s*' + ln).test(x.value || ''));
+  const un = arr.find((x) => new RegExp('Under\\s*' + ln).test(x.value || ''));
+  const oo = ov ? parseFloat(ov.odd) : 0;
+  const uo = un ? parseFloat(un.odd) : 0;
+  if (oo > 0 && uo > 0) return oo <= uo ? `Over ${ln}` : `Under ${ln}`;
+  return '';
 }
 function extractFromNextData(html) {
   const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
@@ -141,25 +190,35 @@ function extractFromNextData(html) {
   const rows = data && data.props && data.props.pageProps && data.props.pageProps.initialData;
   if (!Array.isArray(rows)) return [];
   return rows.map((r) => {
-    const timePart = String(r.date || '').split(' ')[1] || '';
-    const h = parseInt(r.percent_pred_home, 10) || 0;
-    const d = parseInt(r.percent_pred_draw, 10) || 0;
-    const a = parseInt(r.percent_pred_away, 10) || 0;
-    const score = r.goals_home != null && r.goals_away != null ? `${r.goals_home}-${r.goals_away}` : '';
+    const time = String(r.date || '').split(' ')[1] || '';
+    // Prefer probabilities implied by real odds; fall back to the site's percent fields.
+    const oddsPct = impliedPct(r.bets_home, r.bets_draw, r.bets_away);
+    const hasOdds = oddsPct[0] + oddsPct[1] + oddsPct[2] > 0;
+    let [h, d, a] = oddsPct;
+    if (!hasOdds) {
+      h = parseInt(r.percent_pred_home, 10) || 0;
+      d = parseInt(r.percent_pred_draw, 10) || 0;
+      a = parseInt(r.percent_pred_away, 10) || 0;
+    }
+    const prediction = predFrom(h, d, a);
+    const liveScore = r.goals_home != null && r.goals_away != null ? `${r.goals_home}-${r.goals_away}` : '';
+    const ou = overUnderTip(r.goals_over_under, r.under_over);
+    const winText = prediction === '1' ? 'Home Win' : prediction === '2' ? 'Away Win' : prediction === 'X' ? 'Draw' : '';
     return {
       date: r.unformatedDate || '',
-      time: timePart,
+      time,
       homeTeam: r.home_team_name || '',
       awayTeam: r.away_team_name || '',
-      score,
+      score: liveScore,
       status: normStatus(r),
       league: r.league_name || '',
-      prediction: predFromPercents(h, d, a),
-      correctScore: '',
+      prediction,
+      correctScore: bestCorrectScore(r.double_chance_goals, prediction),
       probHome: h,
       probDraw: d,
       probAway: a,
-      advice: '',
+      advice: [winText, ou].filter(Boolean).join(' · '),
+      hasOdds,
     };
   });
 }
@@ -247,6 +306,7 @@ async function runScrape(trigger = 'scheduler') {
     const preds = {};
     for (const p of list) {
       if (!p.homeTeam || !p.awayTeam) continue;
+      if (ONLY_WITH_ODDS && !p.hasOdds) continue; // hide thin amateur matches unless disabled
       const k = matchKey(p.homeTeam, p.awayTeam);
       const h = clampPct(p.probHome);
       const d = clampPct(p.probDraw);
