@@ -14,9 +14,9 @@
  *   TARGET_URL           the predictions page to scrape
  *   BROWSERLESS_TOKEN    required - your browserless.io API token
  *   BROWSERLESS_HOST     browserless host (default chrome.browserless.io)
+ *   BROWSERLESS_PROXY    optional - set to "residential" to use Browserless's proxy
  *   OPENAI_API_KEY       required - used to extract predictions from HTML
  *   OPENAI_MODEL         default gpt-4o-mini
- *   PROXY_HOST/PORT/USER/PASS   optional residential proxy (e.g. iProyal)
  *   TELEGRAM_BOT_TOKEN   optional - enables /scrape and /status commands
  *   TELEGRAM_ADMIN_ID    optional - restricts the bot to you
  *   ADMIN_KEY            optional - protects the /scrape-now URL
@@ -36,11 +36,6 @@ const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '';
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-
-const PROXY_HOST = process.env.PROXY_HOST || '';
-const PROXY_PORT = process.env.PROXY_PORT || '';
-const PROXY_USER = process.env.PROXY_USER || '';
-const PROXY_PASS = process.env.PROXY_PASS || '';
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID || '';
@@ -82,19 +77,19 @@ function httpRequest(method, urlString, { headers = {}, body = null, timeout = 6
 // Step 1: render the page in a cloud browser and return its HTML.
 async function fetchPageHTML() {
   if (!BROWSERLESS_TOKEN) throw new Error('BROWSERLESS_TOKEN not set');
-  const url = `https://${BROWSERLESS_HOST}/content?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+  // Browserless v2 takes the proxy as a QUERY PARAM, not in the POST body.
+  // Optional: set env BROWSERLESS_PROXY=residential to route via Browserless's
+  // built-in residential proxy (helps bypass Cloudflare). Leave it unset for no proxy.
+  let url = `https://${BROWSERLESS_HOST}/content?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+  const bproxy = process.env.BROWSERLESS_PROXY || '';
+  if (bproxy) {
+    url += `&proxy=${encodeURIComponent(bproxy)}&proxySticky=true`;
+    if (process.env.PROXY_COUNTRY) url += `&proxyCountry=${encodeURIComponent(process.env.PROXY_COUNTRY)}`;
+  }
   const payload = {
     url: TARGET_URL,
     gotoOptions: { waitUntil: 'networkidle2', timeout: 45000 },
   };
-  // A residential proxy helps get past anti-bot/Cloudflare protection.
-  if (PROXY_HOST && PROXY_PORT) {
-    payload.proxy = {
-      server: `${PROXY_HOST}:${PROXY_PORT}`,
-      username: PROXY_USER || undefined,
-      password: PROXY_PASS || undefined,
-    };
-  }
   const { status: code, text } = await httpRequest('POST', url, { body: payload });
   if (code !== 200) throw new Error(`Browserless HTTP ${code}: ${text.slice(0, 200)}`);
   if (!text || text.length < 200) throw new Error('Browserless returned empty/short HTML');
