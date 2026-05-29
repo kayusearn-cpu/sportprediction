@@ -5,7 +5,7 @@
  *
  * Pipeline (runs on boot, then every REFRESH_MINUTES):
  *   1. Browserless loads TARGET_URL in a real cloud browser (optionally via proxy).
- *   2. OpenAI reads the rendered HTML and returns structured predictions as JSON.
+ *   2. We parse the matches out of the page (structured JSON first, AI as fallback).
  *   3. Results are cached in memory and served to your website at /api/scores.
  *
  * All config comes from environment variables (no secrets in this file):
@@ -15,7 +15,7 @@
  *   BROWSERLESS_TOKEN    required - your browserless.io API token
  *   BROWSERLESS_HOST     browserless host (default chrome.browserless.io)
  *   BROWSERLESS_PROXY    optional - set to "residential" to use Browserless's proxy
- *   OPENAI_API_KEY       required - used to extract predictions from HTML
+ *   OPENAI_API_KEY       optional - only a fallback if the site's JSON is missing
  *   OPENAI_MODEL         default gpt-4o-mini
  *   TELEGRAM_BOT_TOKEN   optional - enables /scrape and /status commands
  *   TELEGRAM_ADMIN_ID    optional - restricts the bot to you
@@ -114,8 +114,70 @@ function htmlToText(html) {
     .trim();
 }
 
-// Step 2: turn raw HTML into structured predictions using OpenAI.
+// Step 2a: pitchpredictions.com is a Next.js site that ships ALL matches as JSON
+// inside a __NEXT_DATA__ script tag. Parsing it returns every match with exact
+// fields (teams, date/time, live score, status, prediction %) - no AI, no cost.
+function predFromPercents(h, d, a) {
+  const max = Math.max(h, d, a);
+  if (max <= 0) return '';
+  return max === h ? '1' : max === a ? '2' : 'X';
+}
+function normStatus(r) {
+  const s = String(r.status_short || '').toUpperCase();
+  if (['NS', 'TBD', 'PST'].includes(s)) return 'NS';
+  if (['FT', 'AET', 'PEN'].includes(s)) return 'FT';
+  if (s) return 'LIVE';
+  return r.goals_home != null ? 'LIVE' : 'NS';
+}
+function extractFromNextData(html) {
+  const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!m) return [];
+  let data;
+  try {
+    data = JSON.parse(m[1]);
+  } catch (e) {
+    return [];
+  }
+  const rows = data && data.props && data.props.pageProps && data.props.pageProps.initialData;
+  if (!Array.isArray(rows)) return [];
+  return rows.map((r) => {
+    const timePart = String(r.date || '').split(' ')[1] || '';
+    const h = parseInt(r.percent_pred_home, 10) || 0;
+    const d = parseInt(r.percent_pred_draw, 10) || 0;
+    const a = parseInt(r.percent_pred_away, 10) || 0;
+    const score = r.goals_home != null && r.goals_away != null ? `${r.goals_home}-${r.goals_away}` : '';
+    return {
+      date: r.unformatedDate || '',
+      time: timePart,
+      homeTeam: r.home_team_name || '',
+      awayTeam: r.away_team_name || '',
+      score,
+      status: normStatus(r),
+      league: r.league_name || '',
+      prediction: predFromPercents(h, d, a),
+      correctScore: '',
+      probHome: h,
+      probDraw: d,
+      probAway: a,
+      advice: '',
+    };
+  });
+}
+
+// Step 2: try the structured JSON first; fall back to AI text-extraction only if needed.
 async function extractPredictions(html) {
+  const fromJson = extractFromNextData(html);
+  if (fromJson.length) {
+    console.log(`[extract] __NEXT_DATA__ -> ${fromJson.length} matches`);
+    return fromJson;
+  }
+  if (!OPENAI_KEY) return [];
+  console.log('[extract] no __NEXT_DATA__ matches; falling back to OpenAI');
+  return extractWithOpenAI(html);
+}
+
+// Fallback: extract predictions from page text with OpenAI (only if JSON parsing finds nothing).
+async function extractWithOpenAI(html) {
   if (!OPENAI_KEY) throw new Error('OPENAI_API_KEY not set');
   const sys = `You extract football (soccer) match predictions from raw HTML.
 Return ONLY a JSON object of the form { "matches": [ ... ] }.
@@ -209,7 +271,7 @@ async function runScrape(trigger = 'scheduler') {
         advice: p.advice || (p.prediction === '1' ? 'Home Win' : p.prediction === '2' ? 'Away Win' : p.prediction === 'X' ? 'Draw' : ''),
         confidence: Math.round(Math.max(h, d, a) / 10) / 10,
         sources: ['scraped'],
-        aiUsed: true,
+        aiUsed: false,
       };
     }
 
