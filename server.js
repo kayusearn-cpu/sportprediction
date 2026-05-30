@@ -13,8 +13,8 @@
  *   REFRESH_MINUTES      how often to re-scrape (default 20)
  *   TARGET_URL           primary predictions page (default: Forebet's today page)
  *   FALLBACK_URL         used if the primary returns nothing (default: pitchpredictions)
- *   ONLY_WITH_ODDS       "true" (default) = only show matches that have real odds/full
- *                        data (the top matches); "false" = show every match
+ *   ONLY_WITH_ODDS       "true" (default) = only show upcoming matches that have real odds
+ *                        (LIVE and FT matches always show). "false" = show everything.
  *   BROWSERLESS_TOKEN    required - your browserless.io API token
  *   BROWSERLESS_HOST     browserless host (default chrome.browserless.io)
  *   BROWSERLESS_PROXY    set "residential" to clear Cloudflare on the primary (needed for Forebet)
@@ -124,8 +124,9 @@ function htmlToText(html) {
     .trim();
 }
 
-// Step 2a: pitchpredictions.com (Next.js) ships all matches as JSON in __NEXT_DATA__.
-// We derive predictions from the betting markets it provides (odds) — accurate and free.
+// Step 2a: pitchpredictions.com is a Next.js site that ships ALL matches as JSON
+// inside a __NEXT_DATA__ script tag. Parsing it returns every match with exact
+// fields (teams, date/time, live score, status, prediction %) - no AI, no cost.
 function maybeJson(s) {
   try {
     return JSON.parse(s);
@@ -133,6 +134,7 @@ function maybeJson(s) {
     return null;
   }
 }
+// 1X2 probabilities implied by decimal odds (the accurate, bookmaker-based method).
 function impliedPct(homeOdd, drawOdd, awayOdd) {
   const inv = [homeOdd, drawOdd, awayOdd].map((o) => {
     const n = parseFloat(o);
@@ -154,6 +156,7 @@ function normStatus(r) {
   if (s) return 'LIVE';
   return r.goals_home != null ? 'LIVE' : 'NS';
 }
+// Most likely scoreline: lowest-odds entry that matches the predicted 1X2 result.
 function bestCorrectScore(dcgRaw, pred) {
   const arr = maybeJson(dcgRaw) || [];
   let best = null;
@@ -171,6 +174,7 @@ function bestCorrectScore(dcgRaw, pred) {
   }
   return best || any ? (best || any).s : '';
 }
+// Over/Under tip for the match's main line (lower odds = the pick).
 function overUnderTip(gouRaw, line) {
   const arr = maybeJson(gouRaw) || [];
   const ln = line || '2.5';
@@ -194,6 +198,7 @@ function extractFromNextData(html) {
   if (!Array.isArray(rows)) return [];
   return rows.map((r) => {
     const time = String(r.date || '').split(' ')[1] || '';
+    // Prefer probabilities implied by real odds; fall back to the site's percent fields.
     const oddsPct = impliedPct(r.bets_home, r.bets_draw, r.bets_away);
     const hasOdds = oddsPct[0] + oddsPct[1] + oddsPct[2] > 0;
     let [h, d, a] = oddsPct;
@@ -338,9 +343,16 @@ async function runScrape(trigger = 'scheduler') {
 
     const matches = {};
     const preds = {};
+    const now = Date.now();
     for (const p of list) {
       if (!p.homeTeam || !p.awayTeam) continue;
-      if (ONLY_WITH_ODDS && !p.hasOdds) continue; // hide thin amateur matches unless disabled
+      // Only filter upcoming matches by odds — always show LIVE/FT matches (they have real scores).
+      if (ONLY_WITH_ODDS && !p.hasOdds && p.status === 'NS') continue;
+      // Drop stale NS matches whose kick-off was >4 h ago (source sometimes never updates them).
+      if (p.status === 'NS' && p.date && p.time) {
+        const t = Date.parse(`${p.date}T${p.time}:00Z`);
+        if (!isNaN(t) && now - t > 4 * 60 * 60 * 1000) continue;
+      }
       const k = matchKey(p.homeTeam, p.awayTeam);
       const h = clampPct(p.probHome);
       const d = clampPct(p.probDraw);
