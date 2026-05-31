@@ -4,31 +4,31 @@
  * Football prediction scraper.
  *
  * Pipeline (runs on boot, then every REFRESH_MINUTES):
- *   1. Browserless loads SEVERAL pages (today, yesterday, tomorrow + your primary).
- *   2. We parse the matches out of them and merge everything into one cache.
- *   3. Time-aware status inference puts each match into Live / Upcoming / Past correctly.
- *   4. Served to your website at /api/scores. 48 h retention on finished matches.
+ *   1. Scrape today/yesterday/tomorrow from pitchpredictions via plain HTTPS (no Browserless),
+ *      plus an optional primary source (Forebet) via Browserless if its token+proxy work.
+ *   2. Merge results into an in-memory cache (also persisted to disk).
+ *   3. Re-infer each match's status from kickoff time so Live/Upcoming/Past all populate.
+ *   4. Serve everything to your website at /api/scores.
  *
- * All config comes from environment variables (no secrets in this file):
+ * Env variables:
  *   PORT                 web port (Railway sets this automatically)
  *   REFRESH_MINUTES      how often to re-scrape (default 20)
- *   TARGET_URL           primary predictions page (default: Forebet's today page)
- *   FALLBACK_URL         pitchpredictions today page (default works fine)
- *   ONLY_WITH_ODDS       "true" (default) = only show upcoming matches that have real odds
- *                        (LIVE/FT matches always show). "false" = show everything.
- *   BROWSERLESS_TOKEN    required - your browserless.io API token
- *   BROWSERLESS_HOST     browserless host (default chrome.browserless.io)
- *   BROWSERLESS_PROXY    set "residential" to clear Cloudflare on the primary (Forebet)
- *   OPENAI_API_KEY       needed for Forebet (it has no JSON, so the AI parser reads it)
+ *   TARGET_URL           optional primary page (e.g. Forebet) - tried first via Browserless
+ *   FALLBACK_URL         pitchpredictions URL (default https://www.pitchpredictions.com)
+ *   ONLY_WITH_ODDS       "true" (default) = hide amateur upcoming matches w/o real odds
+ *   CACHE_FILE           where to persist the cache (default /tmp/sportprediction-cache.json)
+ *   BROWSERLESS_TOKEN    only needed for TARGET_URL (Forebet) — pp doesn't use it
+ *   BROWSERLESS_HOST     default chrome.browserless.io
+ *   BROWSERLESS_PROXY    set "residential" to clear Cloudflare on the primary
+ *   OPENAI_API_KEY       only needed for TARGET_URL (Forebet has no JSON)
  *   OPENAI_MODEL         default gpt-4o-mini
- *   TELEGRAM_BOT_TOKEN   optional - enables /scrape and /status commands
- *   TELEGRAM_ADMIN_ID    optional - restricts the bot to you
- *   ADMIN_KEY            optional - protects the /scrape-now URL
+ *   TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_ID / ADMIN_KEY   optional bot/manual controls
  */
 
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
+const fs = require('fs');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
@@ -47,10 +47,31 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
-// In-memory cache. Updated incrementally on every scrape (NOT wiped) so finished
-// matches survive long enough to populate the Past section.
+// Cache file — survives process restarts. /tmp gets wiped on a NEW Railway deploy but kept
+// across in-place restarts. For full deploy-persistence add a Railway Volume and set
+// CACHE_FILE=/data/cache.json (or wherever you mount it).
+const CACHE_FILE = process.env.CACHE_FILE || '/tmp/sportprediction-cache.json';
+
+// In-memory cache. Updated incrementally (NOT wiped) so finished matches survive long
+// enough to populate the Past section.
 const store = { matches: {}, preds: {} };
 const status = { lastRun: null, lastOk: null, lastError: null, lastCount: 0, running: false, source: null };
+
+function loadCache() {
+  try {
+    const raw = fs.readFileSync(CACHE_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (data && data.matches && data.preds) {
+      store.matches = data.matches;
+      store.preds = data.preds;
+      console.log(`[cache] loaded ${Object.keys(store.matches).length} matches from ${CACHE_FILE}`);
+    }
+  } catch (e) { /* no cache yet, or invalid — start fresh */ }
+}
+function saveCache() {
+  try { fs.writeFileSync(CACHE_FILE, JSON.stringify(store)); }
+  catch (e) { console.error('[cache] save failed:', e.message); }
+}
 
 function matchKey(home, away) {
   return `${(home || '').trim().toLowerCase()}|${(away || '').trim().toLowerCase()}`;
@@ -81,7 +102,7 @@ function httpRequest(method, urlString, { headers = {}, body = null, timeout = 6
   });
 }
 
-// Step 1: render a page in a cloud browser and return its HTML.
+// Step 1: render a page in a cloud browser. Only used for sites that need JS (e.g. Forebet).
 async function fetchPageHTML(targetUrl, useProxy) {
   if (!BROWSERLESS_TOKEN) throw new Error('BROWSERLESS_TOKEN not set');
   let url = `https://${BROWSERLESS_HOST}/content?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
@@ -90,10 +111,7 @@ async function fetchPageHTML(targetUrl, useProxy) {
     url += `&proxy=${encodeURIComponent(bproxy)}&proxySticky=true`;
     if (process.env.PROXY_COUNTRY) url += `&proxyCountry=${encodeURIComponent(process.env.PROXY_COUNTRY)}`;
   }
-  const payload = {
-    url: targetUrl,
-    gotoOptions: { waitUntil: 'networkidle2', timeout: 45000 },
-  };
+  const payload = { url: targetUrl, gotoOptions: { waitUntil: 'networkidle2', timeout: 45000 } };
   const { status: code, text } = await httpRequest('POST', url, { body: payload });
   if (code !== 200) throw new Error(`Browserless HTTP ${code}: ${text.slice(0, 200)}`);
   if (!text || text.length < 200) throw new Error('Browserless returned empty/short HTML');
@@ -101,12 +119,27 @@ async function fetchPageHTML(targetUrl, useProxy) {
 }
 
 // Detect a Cloudflare "Just a moment" interstitial so we can skip extraction on it.
-// Cap raised to 80 KB so we catch Forebet's ~32 KB challenge page (was being missed).
 function isCloudflareChallenge(html) {
   return /just a moment|challenge-platform|cf-browser-verification|cf_chl_/i.test(html) && html.length < 80000;
 }
 
-// Strip scripts/styles/markup so the model sees real content, not 600KB of noise.
+// Plain HTTPS fetch with a browser User-Agent. Used for sites that don't need JS rendering
+// (like pitchpredictions, which server-renders all match data into __NEXT_DATA__). Free
+// and ~10x faster than going through Browserless.
+async function fetchPageDirect(targetUrl) {
+  const { status: code, text } = await httpRequest('GET', targetUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  });
+  if (code !== 200) throw new Error(`Direct HTTP ${code}: ${text.slice(0, 200)}`);
+  if (!text || text.length < 200) throw new Error('Direct fetch returned empty/short HTML');
+  return text;
+}
+
+// Strip scripts/styles/markup so the OpenAI parser sees real content, not 600KB of noise.
 function htmlToText(html) {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -124,109 +157,76 @@ function htmlToText(html) {
     .trim();
 }
 
-// Step 2a: pitchpredictions.com (Next.js) ships all matches as JSON in __NEXT_DATA__.
-function maybeJson(s) {
-  try {
-    return JSON.parse(s);
-  } catch (e) {
-    return null;
-  }
-}
-function impliedPct(homeOdd, drawOdd, awayOdd) {
-  const inv = [homeOdd, drawOdd, awayOdd].map((o) => {
-    const n = parseFloat(o);
-    return n > 0 ? 1 / n : 0;
-  });
-  const sum = inv.reduce((a, b) => a + b, 0);
-  if (sum <= 0) return [0, 0, 0];
-  return inv.map((x) => Math.round((x / sum) * 100));
-}
+// 1X2 pick from probabilities.
 function predFrom(h, d, a) {
   const max = Math.max(h, d, a);
   if (max <= 0) return '';
   return max === h ? '1' : max === a ? '2' : 'X';
 }
-function normStatus(r) {
-  const s = String(r.status_short || '').toUpperCase();
-  if (['NS', 'TBD', 'PST'].includes(s)) return 'NS';
-  if (['FT', 'AET', 'PEN'].includes(s)) return 'FT';
-  if (s) return 'LIVE';
-  return r.goals_home != null ? 'LIVE' : 'NS';
-}
-// Source data often leaves matches stuck as "NS" forever. Infer real status from the
-// kickoff time so the front-end can put each match into the right Live/Upcoming/Past bucket.
+
+// Time-based status inference — source data is unreliable, so we infer NS/LIVE/FT
+// from the kickoff time instead of trusting whatever the source says.
 function effectiveStatus(date, time, sourceStatus) {
-  if (sourceStatus === 'FT') return 'FT';                       // trust explicit FT from source
+  if (sourceStatus === 'FT') return 'FT';
   if (!date || !time) return sourceStatus || 'NS';
   const t = Date.parse(`${date}T${time}:00Z`);
   if (isNaN(t)) return sourceStatus || 'NS';
   const minutesPast = (Date.now() - t) / 60000;
-  if (minutesPast < 0) return 'NS';        // hasn't kicked off yet
-  if (minutesPast < 150) return 'LIVE';    // ~90 min + halftime + extra time + buffer
-  return 'FT';                              // probably finished
+  if (minutesPast < 0) return 'NS';
+  if (minutesPast < 150) return 'LIVE';
+  return 'FT';
 }
-function bestCorrectScore(dcgRaw, pred) {
-  const arr = maybeJson(dcgRaw) || [];
-  let best = null;
-  let any = null;
-  for (const it of arr) {
-    const mm = String(it.value || '').match(/(\d+)\s*:\s*(\d+)/);
-    if (!mm) continue;
-    const hs = +mm[1];
-    const as = +mm[2];
-    const odd = parseFloat(it.odd);
-    if (!(odd > 0)) continue;
-    const outcome = hs > as ? '1' : hs < as ? '2' : 'X';
-    if (!any || odd < any.odd) any = { odd, s: `${hs}-${as}` };
-    if (pred && outcome === pred && (!best || odd < best.odd)) best = { odd, s: `${hs}-${as}` };
-  }
-  return best || any ? (best || any).s : '';
-}
-function overUnderTip(gouRaw, line) {
-  const arr = maybeJson(gouRaw) || [];
-  const ln = line || '2.5';
-  const ov = arr.find((x) => new RegExp('Over\\s*' + ln).test(x.value || ''));
-  const un = arr.find((x) => new RegExp('Under\\s*' + ln).test(x.value || ''));
-  const oo = ov ? parseFloat(ov.odd) : 0;
-  const uo = un ? parseFloat(un.odd) : 0;
-  if (oo > 0 && uo > 0) return oo <= uo ? `Over ${ln}` : `Under ${ln}`;
-  return '';
-}
+
+// Extract matches from pitchpredictions' Next.js __NEXT_DATA__ JSON (server-rendered).
 function extractFromNextData(html) {
   const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (!m) return [];
   let data;
-  try {
-    data = JSON.parse(m[1]);
-  } catch (e) {
-    return [];
-  }
+  try { data = JSON.parse(m[1]); } catch (e) { return []; }
   const rows = data && data.props && data.props.pageProps && data.props.pageProps.initialData;
   if (!Array.isArray(rows)) return [];
   return rows.map((r) => {
-    const time = String(r.date || '').split(' ')[1] || '';
-    const oddsPct = impliedPct(r.bets_home, r.bets_draw, r.bets_away);
-    const hasOdds = oddsPct[0] + oddsPct[1] + oddsPct[2] > 0;
-    let [h, d, a] = oddsPct;
-    if (!hasOdds) {
-      h = parseInt(r.percent_pred_home, 10) || 0;
-      d = parseInt(r.percent_pred_draw, 10) || 0;
-      a = parseInt(r.percent_pred_away, 10) || 0;
-    }
+    // Date/time from match.datetime (ISO with timezone) or fall back to match.unformatted_date.
+    const dt = r.match && r.match.datetime ? new Date(r.match.datetime) : null;
+    const date = (r.match && r.match.unformatted_date) || (dt && !isNaN(dt) ? dt.toISOString().substring(0, 10) : '');
+    const time = dt && !isNaN(dt) ? dt.toISOString().substring(11, 16) : '';
+
+    // 1X2 model probabilities (already 0-100).
+    const p1x2 = (r.predictions && r.predictions['1x2']) || {};
+    const h = parseInt(p1x2.home, 10) || 0;
+    const d = parseInt(p1x2.draw, 10) || 0;
+    const a = parseInt(p1x2.away, 10) || 0;
+    const hasOdds = parseFloat(r.odds && r.odds.home) > 0;
     const prediction = predFrom(h, d, a);
-    const liveScore = r.goals_home != null && r.goals_away != null ? `${r.goals_home}-${r.goals_away}` : '';
-    const ou = overUnderTip(r.goals_over_under, r.under_over);
+
+    // Live/final score (null until kickoff).
+    const liveHome = r.score && r.score.home;
+    const liveAway = r.score && r.score.away;
+    const liveScore = liveHome != null && liveAway != null ? `${liveHome}-${liveAway}` : '';
+
+    // Normalize source status into NS/LIVE/FT.
+    const srcS = String((r.match && r.match.status) || '').toUpperCase();
+    let status;
+    if (['NS', 'TBD', 'PST'].includes(srcS)) status = 'NS';
+    else if (['FT', 'AET', 'PEN'].includes(srcS)) status = 'FT';
+    else if (srcS) status = 'LIVE';
+    else status = liveHome != null ? 'LIVE' : 'NS';
+
+    // Over/Under 2.5 tip from the model.
+    const ouPred = r.predictions && r.predictions.over_under_2_5 && r.predictions.over_under_2_5.prediction;
+    const ou = ouPred === 'Ov2.5' ? 'Over 2.5' : ouPred === 'Un2.5' ? 'Under 2.5' : '';
     const winText = prediction === '1' ? 'Home Win' : prediction === '2' ? 'Away Win' : prediction === 'X' ? 'Draw' : '';
+
     return {
-      date: r.unformatedDate || '',
+      date,
       time,
-      homeTeam: r.home_team_name || '',
-      awayTeam: r.away_team_name || '',
+      homeTeam: (r.home_team && r.home_team.name) || '',
+      awayTeam: (r.away_team && r.away_team.name) || '',
       score: liveScore,
-      status: normStatus(r),
-      league: r.league_name || '',
+      status,
+      league: (r.league && r.league.name) || '',
       prediction,
-      correctScore: bestCorrectScore(r.double_chance_goals, prediction),
+      correctScore: '', // new pp schema doesn't expose correct-score odds
       probHome: h,
       probDraw: d,
       probAway: a,
@@ -236,7 +236,7 @@ function extractFromNextData(html) {
   });
 }
 
-// Step 2: try the structured JSON first; fall back to AI text-extraction (Forebet path).
+// Try the structured JSON first; fall back to AI text-extraction (used for Forebet).
 async function extractPredictions(html) {
   const fromJson = extractFromNextData(html);
   if (fromJson.length) {
@@ -248,6 +248,7 @@ async function extractPredictions(html) {
   return extractWithOpenAI(html);
 }
 
+// AI parser used for sites without a JSON feed (e.g. Forebet).
 async function extractWithOpenAI(html) {
   if (!OPENAI_KEY) throw new Error('OPENAI_API_KEY not set');
   const sys = `You extract football (soccer) match predictions from raw HTML.
@@ -255,26 +256,20 @@ Return ONLY a JSON object of the form { "matches": [ ... ] }.
 Each match object must have these keys (use empty string "" when unknown):
 - "date"          match date as YYYY-MM-DD
 - "time"          kickoff time as HH:MM (24h)
-- "homeTeam"      home team name
-- "awayTeam"      away team name
+- "homeTeam" / "awayTeam"
 - "score"         current or final score like "1-2"; "" if not started
-- "status"        one of "NS" (not started), "LIVE", "FT" (finished)
-- "league"        competition name; "" if unknown
-- "prediction"    one of "1" (home win), "X" (draw), "2" (away win)
-- "correctScore"  predicted scoreline like "2-1"; "" if none
-- "probHome"      integer 0-100
-- "probDraw"      integer 0-100
-- "probAway"      integer 0-100
-- "advice"        short tip text e.g. "Home Win" or "Over 2.5"
+- "status"        one of "NS", "LIVE", "FT"
+- "league"
+- "prediction"    one of "1", "X", "2"
+- "correctScore"  e.g. "2-1"; "" if none
+- "probHome" / "probDraw" / "probAway"  integers 0-100
+- "advice"        short tip text
 Only include real matches found in the HTML. Never invent data.`;
   let userText = htmlToText(html);
   if (userText.length < 500) userText = html;
   const body = {
     model: OPENAI_MODEL,
-    messages: [
-      { role: 'system', content: sys },
-      { role: 'user', content: userText.slice(0, 100000) },
-    ],
+    messages: [{ role: 'system', content: sys }, { role: 'user', content: userText.slice(0, 100000) }],
     response_format: { type: 'json_object' },
     temperature: 0.1,
     max_tokens: 4000,
@@ -301,37 +296,33 @@ function parseScore(score, idx) {
   return m ? parseInt(m[idx + 1], 10) : null;
 }
 
-// Step 3: scrape multiple pages and merge them so all three sections populate.
+// Scrape multiple pages, merge into cache, re-infer status by time, evict old, persist.
 async function runScrape(trigger = 'scheduler') {
-  if (status.running) {
-    console.log('[scrape] already running, skipping');
-    return { skipped: true };
-  }
+  if (status.running) { console.log('[scrape] already running, skipping'); return { skipped: true }; }
   status.running = true;
   status.lastRun = new Date().toISOString();
   console.log(`[scrape] start (${trigger})`);
   try {
-    // Scrape MULTIPLE pages and merge them all so every section populates straight away:
-    //   primary    - your TARGET_URL (Forebet by default; usually Cloudflare-blocked for now)
-    //   today      - pitchpredictions homepage (live + upcoming today)
-    //   yesterday  - pitchpredictions /yesterday (finished matches → Past section)
-    //   tomorrow   - pitchpredictions /tomorrow (more upcoming)
+    // useBrowser=true uses Browserless (needed for JS/Cloudflare sites like Forebet).
+    // useBrowser=false uses plain HTTPS — pitchpredictions is server-rendered, no browser needed.
     const PP = 'https://www.pitchpredictions.com';
     const sources = [
-      { name: 'primary',   url: TARGET_URL,                                useProxy: true  },
-      { name: 'today',     url: FALLBACK_URL || PP,                         useProxy: false },
-      { name: 'yesterday', url: PP + '/football-predictions-yesterday',     useProxy: false },
-      { name: 'tomorrow',  url: PP + '/football-predictions-tomorrow',      useProxy: false },
+      { name: 'primary',   url: TARGET_URL,                                useBrowser: true,  useProxy: true  },
+      { name: 'today',     url: FALLBACK_URL || PP,                         useBrowser: false },
+      { name: 'yesterday', url: PP + '/football-predictions-yesterday',     useBrowser: false },
+      { name: 'tomorrow',  url: PP + '/football-predictions-tomorrow',      useBrowser: false },
     ].filter((s) => s.url);
     const seenUrls = new Set();
     let list = [];
     const usedSources = [];
     let why = '';
     for (const src of sources) {
-      if (seenUrls.has(src.url)) continue; // skip if same URL configured twice
+      if (seenUrls.has(src.url)) continue;
       seenUrls.add(src.url);
       try {
-        const html = await fetchPageHTML(src.url, src.useProxy);
+        const html = src.useBrowser
+          ? await fetchPageHTML(src.url, src.useProxy)
+          : await fetchPageDirect(src.url);
         if (isCloudflareChallenge(html)) {
           why = `${src.name}: blocked by Cloudflare`;
           console.log(`[scrape] ${why}`);
@@ -353,16 +344,13 @@ async function runScrape(trigger = 'scheduler') {
     status.source = usedSources.join(' + ') || null;
     if (!list.length) throw new Error(why || 'no matches from any source');
 
-    // Merge new scrape into existing cache so finished matches persist across days
-    // (the source rotates them off the homepage once a new day begins).
+    // Merge new scrape into existing cache so finished matches persist across days.
     const now = Date.now();
     const newMatches = { ...store.matches };
     const newPreds = { ...store.preds };
     for (const p of list) {
       if (!p.homeTeam || !p.awayTeam) continue;
-      // Time-aware status: source data is unreliable, infer from kickoff time.
       p.status = effectiveStatus(p.date, p.time, p.status);
-      // Only filter upcoming matches by odds — always show LIVE/FT (real or inferred).
       if (ONLY_WITH_ODDS && !p.hasOdds && p.status === 'NS') continue;
       const k = matchKey(p.homeTeam, p.awayTeam);
       const h = clampPct(p.probHome);
@@ -381,9 +369,7 @@ async function runScrape(trigger = 'scheduler') {
         advice: p.advice || '',
       };
       newPreds[k] = {
-        h,
-        d,
-        a,
+        h, d, a,
         score: p.correctScore || '',
         advice: p.advice || (p.prediction === '1' ? 'Home Win' : p.prediction === '2' ? 'Away Win' : p.prediction === 'X' ? 'Draw' : ''),
         confidence: Math.round(Math.max(h, d, a) / 10) / 10,
@@ -391,8 +377,7 @@ async function runScrape(trigger = 'scheduler') {
         aiUsed: true,
       };
     }
-    // Re-infer status for ALL cached matches so NS → LIVE → FT progresses over time
-    // even for matches that already rolled off the source feed.
+    // Re-infer status for ALL cached matches (so NS → LIVE → FT progresses over time).
     for (const k of Object.keys(newMatches)) {
       newMatches[k].status = effectiveStatus(newMatches[k].date, newMatches[k].time, newMatches[k].status);
     }
@@ -411,6 +396,7 @@ async function runScrape(trigger = 'scheduler') {
 
     store.matches = newMatches;
     store.preds = newPreds;
+    saveCache();
     status.lastOk = new Date().toISOString();
     status.lastError = null;
     status.lastCount = Object.keys(store.matches).length;
@@ -427,35 +413,21 @@ async function runScrape(trigger = 'scheduler') {
   }
 }
 
-// ---- Optional Telegram control (only active if TELEGRAM_BOT_TOKEN is set) ----
+// ---- Optional Telegram control ----
 function tgSend(chatId, text) {
   if (!TG_TOKEN) return;
   httpRequest('POST', `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
     body: { chat_id: chatId, text, parse_mode: 'HTML' },
   }).catch(() => {});
 }
-
 function statusText() {
-  return (
-    `📊 <b>Status</b>\n` +
-    `Matches cached: ${Object.keys(store.matches).length}\n` +
-    `Source: ${status.source || 'none'}\n` +
-    `Last run: ${status.lastRun || 'never'}\n` +
-    `Last success: ${status.lastOk || 'never'}\n` +
-    `Last error: ${status.lastError || 'none'}\n` +
-    `Auto-refresh: every ${REFRESH_MINUTES} min`
-  );
+  return `📊 <b>Status</b>\nMatches cached: ${Object.keys(store.matches).length}\nSource: ${status.source || 'none'}\nLast run: ${status.lastRun || 'never'}\nLast success: ${status.lastOk || 'never'}\nLast error: ${status.lastError || 'none'}\nAuto-refresh: every ${REFRESH_MINUTES} min`;
 }
-
 let tgOffset = 0;
 async function pollTelegram() {
   if (!TG_TOKEN) return;
   try {
-    const { text } = await httpRequest(
-      'GET',
-      `https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=30&offset=${tgOffset}`,
-      { timeout: 40000 }
-    );
+    const { text } = await httpRequest('GET', `https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=30&offset=${tgOffset}`, { timeout: 40000 });
     const data = JSON.parse(text);
     if (data.ok) {
       for (const up of data.result) {
@@ -466,16 +438,12 @@ async function pollTelegram() {
         const chatId = msg.chat.id;
         const cmd = msg.text.trim().toLowerCase();
         if (cmd === '/start') tgSend(chatId, '⚽ <b>Prediction scraper</b>\n/scrape - run now\n/status - last run info');
-        else if (cmd === '/scrape') {
-          tgSend(chatId, '⏳ Scraping now...');
-          runScrape('telegram').then((r) => tgSend(chatId, r.error ? `❌ ${r.error}` : `✅ ${r.count} matches`));
-        } else if (cmd === '/status') tgSend(chatId, statusText());
+        else if (cmd === '/scrape') { tgSend(chatId, '⏳ Scraping now...'); runScrape('telegram').then((r) => tgSend(chatId, r.error ? `❌ ${r.error}` : `✅ ${r.count} matches`)); }
+        else if (cmd === '/status') tgSend(chatId, statusText());
         else tgSend(chatId, 'Commands: /scrape, /status');
       }
     }
-  } catch (e) {
-    /* transient network error; keep polling */
-  }
+  } catch (e) { /* keep polling */ }
   setTimeout(pollTelegram, 1000);
 }
 
@@ -484,23 +452,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get('/', (req, res) =>
-  res.json({ ok: true, service: 'prediction-scraper', matches: Object.keys(store.matches).length })
-);
+app.get('/', (req, res) => res.json({ ok: true, service: 'prediction-scraper', matches: Object.keys(store.matches).length }));
 
-app.get('/api/health', (req, res) =>
-  res.json({
-    ok: !status.lastError,
-    matches: Object.keys(store.matches).length,
-    lastRun: status.lastRun,
-    lastOk: status.lastOk,
-    lastError: status.lastError,
-    source: status.source,
-    refreshMinutes: REFRESH_MINUTES,
-    target: TARGET_URL,
-    fallback: FALLBACK_URL,
-  })
-);
+app.get('/api/health', (req, res) => res.json({
+  ok: !status.lastError,
+  matches: Object.keys(store.matches).length,
+  lastRun: status.lastRun,
+  lastOk: status.lastOk,
+  lastError: status.lastError,
+  source: status.source,
+  refreshMinutes: REFRESH_MINUTES,
+  target: TARGET_URL,
+  fallback: FALLBACK_URL,
+}));
 
 app.get('/api/scores', (req, res) => {
   const matches = Object.entries(store.matches).map(([key, m]) => {
@@ -514,7 +478,6 @@ app.get('/api/scores', (req, res) => {
   res.json({ updatedAt: status.lastOk, count: matches.length, matches });
 });
 
-// Manual trigger. If ADMIN_KEY is set, call /scrape-now?key=YOUR_KEY
 app.get('/scrape-now', async (req, res) => {
   if (ADMIN_KEY && req.query.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
   res.json(await runScrape('http'));
@@ -523,7 +486,8 @@ app.get('/scrape-now', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`⚽ Prediction scraper live on :${PORT}`);
   console.log(`   primary=${TARGET_URL}`);
-  console.log(`   fallback=${FALLBACK_URL}  refresh=${REFRESH_MINUTES}min  browserless=${BROWSERLESS_HOST}`);
+  console.log(`   fallback=${FALLBACK_URL}  refresh=${REFRESH_MINUTES}min`);
+  loadCache();
   setTimeout(() => runScrape('boot'), 3000);
   setInterval(() => runScrape('scheduler'), REFRESH_MINUTES * 60 * 1000);
   if (TG_TOKEN) pollTelegram();
