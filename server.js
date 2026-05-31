@@ -4,21 +4,21 @@
  * Football prediction scraper.
  *
  * Pipeline (runs on boot, then every REFRESH_MINUTES):
- *   1. Browserless loads a page in a real cloud browser (optionally via proxy).
- *   2. We parse the matches out of it (pitchpredictions JSON, or AI text-parse for Forebet).
- *   3. Results are merged into an in-memory cache and served at /api/scores.
- *      Matches persist for 48 h so finished games stay in the Past section.
+ *   1. Browserless loads SEVERAL pages (today, yesterday, tomorrow + your primary).
+ *   2. We parse the matches out of them and merge everything into one cache.
+ *   3. Time-aware status inference puts each match into Live / Upcoming / Past correctly.
+ *   4. Served to your website at /api/scores. 48 h retention on finished matches.
  *
  * All config comes from environment variables (no secrets in this file):
  *   PORT                 web port (Railway sets this automatically)
  *   REFRESH_MINUTES      how often to re-scrape (default 20)
  *   TARGET_URL           primary predictions page (default: Forebet's today page)
- *   FALLBACK_URL         used if the primary returns nothing (default: pitchpredictions)
+ *   FALLBACK_URL         pitchpredictions today page (default works fine)
  *   ONLY_WITH_ODDS       "true" (default) = only show upcoming matches that have real odds
  *                        (LIVE/FT matches always show). "false" = show everything.
  *   BROWSERLESS_TOKEN    required - your browserless.io API token
  *   BROWSERLESS_HOST     browserless host (default chrome.browserless.io)
- *   BROWSERLESS_PROXY    set "residential" to clear Cloudflare on the primary (needed for Forebet)
+ *   BROWSERLESS_PROXY    set "residential" to clear Cloudflare on the primary (Forebet)
  *   OPENAI_API_KEY       needed for Forebet (it has no JSON, so the AI parser reads it)
  *   OPENAI_MODEL         default gpt-4o-mini
  *   TELEGRAM_BOT_TOKEN   optional - enables /scrape and /status commands
@@ -100,9 +100,10 @@ async function fetchPageHTML(targetUrl, useProxy) {
   return text;
 }
 
-// Detect a Cloudflare "Just a moment" interstitial so we can fall back to another source.
+// Detect a Cloudflare "Just a moment" interstitial so we can skip extraction on it.
+// Cap raised to 80 KB so we catch Forebet's ~32 KB challenge page (was being missed).
 function isCloudflareChallenge(html) {
-  return /just a moment|challenge-platform|cf-browser-verification|cf_chl_/i.test(html) && html.length < 30000;
+  return /just a moment|challenge-platform|cf-browser-verification|cf_chl_/i.test(html) && html.length < 80000;
 }
 
 // Strip scripts/styles/markup so the model sees real content, not 600KB of noise.
@@ -235,7 +236,7 @@ function extractFromNextData(html) {
   });
 }
 
-// Step 2: try the structured JSON first; fall back to AI text-extraction (used for Forebet).
+// Step 2: try the structured JSON first; fall back to AI text-extraction (Forebet path).
 async function extractPredictions(html) {
   const fromJson = extractFromNextData(html);
   if (fromJson.length) {
@@ -247,7 +248,6 @@ async function extractPredictions(html) {
   return extractWithOpenAI(html);
 }
 
-// AI parser: reads predictions out of page text. Used for Forebet (no JSON feed).
 async function extractWithOpenAI(html) {
   if (!OPENAI_KEY) throw new Error('OPENAI_API_KEY not set');
   const sys = `You extract football (soccer) match predictions from raw HTML.
@@ -301,7 +301,7 @@ function parseScore(score, idx) {
   return m ? parseInt(m[idx + 1], 10) : null;
 }
 
-// Step 3: scrape (primary then fallback), merge into cache, re-classify by time, evict old.
+// Step 3: scrape multiple pages and merge them so all three sections populate.
 async function runScrape(trigger = 'scheduler') {
   if (status.running) {
     console.log('[scrape] already running, skipping');
@@ -311,36 +311,46 @@ async function runScrape(trigger = 'scheduler') {
   status.lastRun = new Date().toISOString();
   console.log(`[scrape] start (${trigger})`);
   try {
+    // Scrape MULTIPLE pages and merge them all so every section populates straight away:
+    //   primary    - your TARGET_URL (Forebet by default; usually Cloudflare-blocked for now)
+    //   today      - pitchpredictions homepage (live + upcoming today)
+    //   yesterday  - pitchpredictions /yesterday (finished matches → Past section)
+    //   tomorrow   - pitchpredictions /tomorrow (more upcoming)
+    const PP = 'https://www.pitchpredictions.com';
     const sources = [
-      { name: 'primary', url: TARGET_URL, useProxy: true },
-      { name: 'fallback', url: FALLBACK_URL, useProxy: false },
+      { name: 'primary',   url: TARGET_URL,                                useProxy: true  },
+      { name: 'today',     url: FALLBACK_URL || PP,                         useProxy: false },
+      { name: 'yesterday', url: PP + '/football-predictions-yesterday',     useProxy: false },
+      { name: 'tomorrow',  url: PP + '/football-predictions-tomorrow',      useProxy: false },
     ].filter((s) => s.url);
+    const seenUrls = new Set();
     let list = [];
-    let usedSource = null;
+    const usedSources = [];
     let why = '';
     for (const src of sources) {
+      if (seenUrls.has(src.url)) continue; // skip if same URL configured twice
+      seenUrls.add(src.url);
       try {
         const html = await fetchPageHTML(src.url, src.useProxy);
         if (isCloudflareChallenge(html)) {
-          why = `${src.name} (${src.url}): blocked by Cloudflare`;
+          why = `${src.name}: blocked by Cloudflare`;
           console.log(`[scrape] ${why}`);
           continue;
         }
-        console.log(`[scrape] ${src.name}: fetched ${html.length} bytes, extracting...`);
         const got = await extractPredictions(html);
+        console.log(`[scrape] ${src.name}: ${html.length} bytes → ${got.length} matches`);
         if (got.length) {
-          list = got;
-          usedSource = `${src.name} ${src.url}`;
-          break;
+          list = list.concat(got);
+          usedSources.push(`${src.name}(${got.length})`);
+        } else {
+          why = `${src.name}: 0 matches`;
         }
-        why = `${src.name} (${src.url}): 0 matches`;
-        console.log(`[scrape] ${why}`);
       } catch (e) {
-        why = `${src.name} (${src.url}): ${e.message}`;
+        why = `${src.name}: ${e.message}`;
         console.log(`[scrape] ${why}`);
       }
     }
-    status.source = usedSource;
+    status.source = usedSources.join(' + ') || null;
     if (!list.length) throw new Error(why || 'no matches from any source');
 
     // Merge new scrape into existing cache so finished matches persist across days
@@ -404,8 +414,8 @@ async function runScrape(trigger = 'scheduler') {
     status.lastOk = new Date().toISOString();
     status.lastError = null;
     status.lastCount = Object.keys(store.matches).length;
-    console.log(`[scrape] stored ${status.lastCount} matches from ${usedSource}`);
-    if (TG_TOKEN && ADMIN_ID) tgSend(ADMIN_ID, `✅ Scrape ok: ${status.lastCount} matches (${usedSource}).`);
+    console.log(`[scrape] stored ${status.lastCount} matches (sources: ${status.source || 'none'})`);
+    if (TG_TOKEN && ADMIN_ID) tgSend(ADMIN_ID, `✅ Scrape ok: ${status.lastCount} matches (${status.source}).`);
     return { count: status.lastCount };
   } catch (err) {
     status.lastError = err.message;
