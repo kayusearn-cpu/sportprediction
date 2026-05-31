@@ -6,7 +6,8 @@
  * Pipeline (runs on boot, then every REFRESH_MINUTES):
  *   1. Browserless loads a page in a real cloud browser (optionally via proxy).
  *   2. We parse the matches out of it (pitchpredictions JSON, or AI text-parse for Forebet).
- *   3. Results are cached in memory and served to your website at /api/scores.
+ *   3. Results are merged into an in-memory cache and served at /api/scores.
+ *      Matches persist for 48 h so finished games stay in the Past section.
  *
  * All config comes from environment variables (no secrets in this file):
  *   PORT                 web port (Railway sets this automatically)
@@ -46,7 +47,8 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
-// In-memory cache. Rebuilt fresh on every successful scrape.
+// In-memory cache. Updated incrementally on every scrape (NOT wiped) so finished
+// matches survive long enough to populate the Past section.
 const store = { matches: {}, preds: {} };
 const status = { lastRun: null, lastOk: null, lastError: null, lastCount: 0, running: false, source: null };
 
@@ -82,9 +84,6 @@ function httpRequest(method, urlString, { headers = {}, body = null, timeout = 6
 // Step 1: render a page in a cloud browser and return its HTML.
 async function fetchPageHTML(targetUrl, useProxy) {
   if (!BROWSERLESS_TOKEN) throw new Error('BROWSERLESS_TOKEN not set');
-  // Browserless v2 takes the proxy as a QUERY PARAM, not in the POST body.
-  // A residential proxy (BROWSERLESS_PROXY=residential) helps clear Cloudflare on sites
-  // like Forebet. We only attach it where asked, to avoid wasting paid proxy usage.
   let url = `https://${BROWSERLESS_HOST}/content?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
   const bproxy = process.env.BROWSERLESS_PROXY || '';
   if (useProxy && bproxy) {
@@ -125,7 +124,6 @@ function htmlToText(html) {
 }
 
 // Step 2a: pitchpredictions.com (Next.js) ships all matches as JSON in __NEXT_DATA__.
-// We derive predictions from the betting markets it provides (odds).
 function maybeJson(s) {
   try {
     return JSON.parse(s);
@@ -133,7 +131,6 @@ function maybeJson(s) {
     return null;
   }
 }
-// 1X2 probabilities implied by decimal odds (the accurate, bookmaker-based method).
 function impliedPct(homeOdd, drawOdd, awayOdd) {
   const inv = [homeOdd, drawOdd, awayOdd].map((o) => {
     const n = parseFloat(o);
@@ -155,7 +152,18 @@ function normStatus(r) {
   if (s) return 'LIVE';
   return r.goals_home != null ? 'LIVE' : 'NS';
 }
-// Most likely scoreline: lowest-odds entry that matches the predicted 1X2 result.
+// Source data often leaves matches stuck as "NS" forever. Infer real status from the
+// kickoff time so the front-end can put each match into the right Live/Upcoming/Past bucket.
+function effectiveStatus(date, time, sourceStatus) {
+  if (sourceStatus === 'FT') return 'FT';                       // trust explicit FT from source
+  if (!date || !time) return sourceStatus || 'NS';
+  const t = Date.parse(`${date}T${time}:00Z`);
+  if (isNaN(t)) return sourceStatus || 'NS';
+  const minutesPast = (Date.now() - t) / 60000;
+  if (minutesPast < 0) return 'NS';        // hasn't kicked off yet
+  if (minutesPast < 150) return 'LIVE';    // ~90 min + halftime + extra time + buffer
+  return 'FT';                              // probably finished
+}
 function bestCorrectScore(dcgRaw, pred) {
   const arr = maybeJson(dcgRaw) || [];
   let best = null;
@@ -173,7 +181,6 @@ function bestCorrectScore(dcgRaw, pred) {
   }
   return best || any ? (best || any).s : '';
 }
-// Over/Under tip for the match's main line (lower odds = the pick).
 function overUnderTip(gouRaw, line) {
   const arr = maybeJson(gouRaw) || [];
   const ln = line || '2.5';
@@ -261,7 +268,7 @@ Each match object must have these keys (use empty string "" when unknown):
 - "advice"        short tip text e.g. "Home Win" or "Over 2.5"
 Only include real matches found in the HTML. Never invent data.`;
   let userText = htmlToText(html);
-  if (userText.length < 500) userText = html; // fallback if stripping was too aggressive
+  if (userText.length < 500) userText = html;
   const body = {
     model: OPENAI_MODEL,
     messages: [
@@ -281,8 +288,6 @@ Only include real matches found in the HTML. Never invent data.`;
   const content = data.choices && data.choices[0] && data.choices[0].message.content;
   const parsed = JSON.parse(content || '{}');
   const arr = Array.isArray(parsed) ? parsed : parsed.matches || parsed.predictions || [];
-  // AI-parsed sources (e.g. Forebet) have no odds flag; treat them as full-data matches
-  // so the ONLY_WITH_ODDS filter doesn't drop them.
   return arr.map((x) => ({ ...x, hasOdds: true }));
 }
 
@@ -296,7 +301,7 @@ function parseScore(score, idx) {
   return m ? parseInt(m[idx + 1], 10) : null;
 }
 
-// Step 3: scrape (primary then fallback), extract, and atomically swap the cache.
+// Step 3: scrape (primary then fallback), merge into cache, re-classify by time, evict old.
 async function runScrape(trigger = 'scheduler') {
   if (status.running) {
     console.log('[scrape] already running, skipping');
@@ -306,7 +311,6 @@ async function runScrape(trigger = 'scheduler') {
   status.lastRun = new Date().toISOString();
   console.log(`[scrape] start (${trigger})`);
   try {
-    // Try the primary source (Forebet) first, then fall back so the site is never empty.
     const sources = [
       { name: 'primary', url: TARGET_URL, useProxy: true },
       { name: 'fallback', url: FALLBACK_URL, useProxy: false },
@@ -339,36 +343,34 @@ async function runScrape(trigger = 'scheduler') {
     status.source = usedSource;
     if (!list.length) throw new Error(why || 'no matches from any source');
 
-    const matches = {};
-    const preds = {};
+    // Merge new scrape into existing cache so finished matches persist across days
+    // (the source rotates them off the homepage once a new day begins).
     const now = Date.now();
+    const newMatches = { ...store.matches };
+    const newPreds = { ...store.preds };
     for (const p of list) {
       if (!p.homeTeam || !p.awayTeam) continue;
-      // Reclassify stale NS matches as FT so they show in Past instead of staying in Upcoming
-      // (the source often never updates status for matches it doesn't actively track).
-      if (p.status === 'NS' && p.date && p.time) {
-        const t = Date.parse(`${p.date}T${p.time}:00Z`);
-        if (!isNaN(t) && now - t > 4 * 60 * 60 * 1000) p.status = 'FT';
-      }
-      // Only filter upcoming matches by odds — always show LIVE/FT (real or reclassified).
+      // Time-aware status: source data is unreliable, infer from kickoff time.
+      p.status = effectiveStatus(p.date, p.time, p.status);
+      // Only filter upcoming matches by odds — always show LIVE/FT (real or inferred).
       if (ONLY_WITH_ODDS && !p.hasOdds && p.status === 'NS') continue;
       const k = matchKey(p.homeTeam, p.awayTeam);
       const h = clampPct(p.probHome);
       const d = clampPct(p.probDraw);
       const a = clampPct(p.probAway);
-      matches[k] = {
+      newMatches[k] = {
         id: k,
         date: p.date || '',
         time: p.time || '',
         home: { name: p.homeTeam, score: parseScore(p.score, 0) },
         away: { name: p.awayTeam, score: parseScore(p.score, 1) },
         leagueName: p.league || '',
-        status: p.status || (p.score ? 'LIVE' : 'NS'),
+        status: p.status,
         prediction: p.prediction || '',
         correctScore: p.correctScore || '',
         advice: p.advice || '',
       };
-      preds[k] = {
+      newPreds[k] = {
         h,
         d,
         a,
@@ -379,12 +381,29 @@ async function runScrape(trigger = 'scheduler') {
         aiUsed: true,
       };
     }
+    // Re-infer status for ALL cached matches so NS → LIVE → FT progresses over time
+    // even for matches that already rolled off the source feed.
+    for (const k of Object.keys(newMatches)) {
+      newMatches[k].status = effectiveStatus(newMatches[k].date, newMatches[k].time, newMatches[k].status);
+    }
+    // Evict matches whose kickoff was more than 48 h ago.
+    const evictBefore = now - 48 * 60 * 60 * 1000;
+    for (const k of Object.keys(newMatches)) {
+      const m = newMatches[k];
+      if (m.date && m.time) {
+        const t = Date.parse(`${m.date}T${m.time}:00Z`);
+        if (!isNaN(t) && t < evictBefore) {
+          delete newMatches[k];
+          delete newPreds[k];
+        }
+      }
+    }
 
-    store.matches = matches;
-    store.preds = preds;
+    store.matches = newMatches;
+    store.preds = newPreds;
     status.lastOk = new Date().toISOString();
     status.lastError = null;
-    status.lastCount = Object.keys(matches).length;
+    status.lastCount = Object.keys(store.matches).length;
     console.log(`[scrape] stored ${status.lastCount} matches from ${usedSource}`);
     if (TG_TOKEN && ADMIN_ID) tgSend(ADMIN_ID, `✅ Scrape ok: ${status.lastCount} matches (${usedSource}).`);
     return { count: status.lastCount };
