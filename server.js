@@ -4,11 +4,12 @@
  * Football prediction scraper.
  *
  * Pipeline (runs on boot, then every REFRESH_MINUTES):
- *   1. Scrape today/yesterday/tomorrow from pitchpredictions via plain HTTPS (no Browserless),
- *      plus an optional primary source (Forebet) via Browserless if its token+proxy work.
- *   2. Merge results into an in-memory cache (also persisted to disk).
- *   3. Re-infer each match's status from kickoff time so Live/Upcoming/Past all populate.
- *   4. Serve everything to your website at /api/scores.
+ *   1. Scrape today/yesterday/tomorrow from pitchpredictions — plain HTTPS first, then
+ *      automatic Browserless fallback if Cloudflare blocks us.
+ *   2. Optionally try a primary source (Forebet) via Browserless if BROWSERLESS_TOKEN is set.
+ *   3. Merge results into an in-memory cache (also persisted to disk).
+ *   4. Re-infer each match's status from kickoff time so Live/Upcoming/Past all populate.
+ *   5. Serve everything to your website at /api/scores.
  *
  * Env variables:
  *   PORT                 web port (Railway sets this automatically)
@@ -17,10 +18,10 @@
  *   FALLBACK_URL         pitchpredictions URL (default https://www.pitchpredictions.com)
  *   ONLY_WITH_ODDS       "true" (default) = hide amateur upcoming matches w/o real odds
  *   CACHE_FILE           where to persist the cache (default /tmp/sportprediction-cache.json)
- *   BROWSERLESS_TOKEN    only needed for TARGET_URL (Forebet) — pp doesn't use it
+ *   BROWSERLESS_TOKEN    needed when Cloudflare blocks plain HTTPS or for TARGET_URL
  *   BROWSERLESS_HOST     default chrome.browserless.io
  *   BROWSERLESS_PROXY    set "residential" to clear Cloudflare on the primary
- *   OPENAI_API_KEY       only needed for TARGET_URL (Forebet has no JSON)
+ *   OPENAI_API_KEY       only needed for TARGET_URL fallback (Forebet has no JSON)
  *   OPENAI_MODEL         default gpt-4o-mini
  *   TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_ID / ADMIN_KEY   optional bot/manual controls
  */
@@ -102,7 +103,7 @@ function httpRequest(method, urlString, { headers = {}, body = null, timeout = 6
   });
 }
 
-// Step 1: render a page in a cloud browser. Only used for sites that need JS (e.g. Forebet).
+// Step 1: render a page in a cloud browser. Used for sites that need JS or are CF-protected.
 async function fetchPageHTML(targetUrl, useProxy) {
   if (!BROWSERLESS_TOKEN) throw new Error('BROWSERLESS_TOKEN not set');
   let url = `https://${BROWSERLESS_HOST}/content?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
@@ -118,14 +119,13 @@ async function fetchPageHTML(targetUrl, useProxy) {
   return text;
 }
 
-// Detect a Cloudflare "Just a moment" interstitial so we can skip extraction on it.
+// Detect a Cloudflare "Just a moment" interstitial.
 function isCloudflareChallenge(html) {
   return /just a moment|challenge-platform|cf-browser-verification|cf_chl_/i.test(html) && html.length < 80000;
 }
 
-// Plain HTTPS fetch with a browser User-Agent. Used for sites that don't need JS rendering
-// (like pitchpredictions, which server-renders all match data into __NEXT_DATA__). Free
-// and ~10x faster than going through Browserless.
+// Plain HTTPS fetch with a browser User-Agent. Tried first for sites that don't need JS.
+// Free and ~10x faster than Browserless when it works.
 async function fetchPageDirect(targetUrl) {
   const { status: code, text } = await httpRequest('GET', targetUrl, {
     headers: {
@@ -157,7 +157,6 @@ function htmlToText(html) {
     .trim();
 }
 
-// 1X2 pick from probabilities.
 function predFrom(h, d, a) {
   const max = Math.max(h, d, a);
   if (max <= 0) return '';
@@ -186,12 +185,10 @@ function extractFromNextData(html) {
   const rows = data && data.props && data.props.pageProps && data.props.pageProps.initialData;
   if (!Array.isArray(rows)) return [];
   return rows.map((r) => {
-    // Date/time from match.datetime (ISO with timezone) or fall back to match.unformatted_date.
     const dt = r.match && r.match.datetime ? new Date(r.match.datetime) : null;
     const date = (r.match && r.match.unformatted_date) || (dt && !isNaN(dt) ? dt.toISOString().substring(0, 10) : '');
     const time = dt && !isNaN(dt) ? dt.toISOString().substring(11, 16) : '';
 
-    // 1X2 model probabilities (already 0-100).
     const p1x2 = (r.predictions && r.predictions['1x2']) || {};
     const h = parseInt(p1x2.home, 10) || 0;
     const d = parseInt(p1x2.draw, 10) || 0;
@@ -199,12 +196,10 @@ function extractFromNextData(html) {
     const hasOdds = parseFloat(r.odds && r.odds.home) > 0;
     const prediction = predFrom(h, d, a);
 
-    // Live/final score (null until kickoff).
     const liveHome = r.score && r.score.home;
     const liveAway = r.score && r.score.away;
     const liveScore = liveHome != null && liveAway != null ? `${liveHome}-${liveAway}` : '';
 
-    // Normalize source status into NS/LIVE/FT.
     const srcS = String((r.match && r.match.status) || '').toUpperCase();
     let status;
     if (['NS', 'TBD', 'PST'].includes(srcS)) status = 'NS';
@@ -212,7 +207,6 @@ function extractFromNextData(html) {
     else if (srcS) status = 'LIVE';
     else status = liveHome != null ? 'LIVE' : 'NS';
 
-    // Over/Under 2.5 tip from the model.
     const ouPred = r.predictions && r.predictions.over_under_2_5 && r.predictions.over_under_2_5.prediction;
     const ou = ouPred === 'Ov2.5' ? 'Over 2.5' : ouPred === 'Un2.5' ? 'Under 2.5' : '';
     const winText = prediction === '1' ? 'Home Win' : prediction === '2' ? 'Away Win' : prediction === 'X' ? 'Draw' : '';
@@ -226,7 +220,7 @@ function extractFromNextData(html) {
       status,
       league: (r.league && r.league.name) || '',
       prediction,
-      correctScore: '', // new pp schema doesn't expose correct-score odds
+      correctScore: '',
       probHome: h,
       probDraw: d,
       probAway: a,
@@ -303,8 +297,8 @@ async function runScrape(trigger = 'scheduler') {
   status.lastRun = new Date().toISOString();
   console.log(`[scrape] start (${trigger})`);
   try {
-    // useBrowser=true uses Browserless (needed for JS/Cloudflare sites like Forebet).
-    // useBrowser=false uses plain HTTPS — pitchpredictions is server-rendered, no browser needed.
+    // useBrowser=true forces Browserless. useBrowser=false tries plain HTTPS first, then
+    // auto-falls back to Browserless on Cloudflare blocks.
     const PP = 'https://www.pitchpredictions.com';
     const sources = [
       { name: 'primary',   url: TARGET_URL,                                useBrowser: true,  useProxy: true  },
@@ -320,11 +314,26 @@ async function runScrape(trigger = 'scheduler') {
       if (seenUrls.has(src.url)) continue;
       seenUrls.add(src.url);
       try {
-        const html = src.useBrowser
-          ? await fetchPageHTML(src.url, src.useProxy)
-          : await fetchPageDirect(src.url);
+        let html;
+        if (src.useBrowser) {
+          html = await fetchPageHTML(src.url, src.useProxy);
+        } else {
+          // Try plain HTTPS first (free). If Cloudflare blocks us, fall back to Browserless.
+          try {
+            html = await fetchPageDirect(src.url);
+            if (isCloudflareChallenge(html)) throw new Error('Cloudflare challenge in body');
+          } catch (e) {
+            const blocked = /cloudflare|just a moment|HTTP 403/i.test(e.message);
+            if (blocked && BROWSERLESS_TOKEN) {
+              console.log(`[scrape] ${src.name}: plain HTTPS blocked, retrying via Browserless`);
+              html = await fetchPageHTML(src.url, false);
+            } else {
+              throw e;
+            }
+          }
+        }
         if (isCloudflareChallenge(html)) {
-          why = `${src.name}: blocked by Cloudflare`;
+          why = `${src.name}: blocked by Cloudflare (even via Browserless)`;
           console.log(`[scrape] ${why}`);
           continue;
         }
@@ -377,7 +386,7 @@ async function runScrape(trigger = 'scheduler') {
         aiUsed: true,
       };
     }
-    // Re-infer status for ALL cached matches (so NS → LIVE → FT progresses over time).
+    // Re-infer status for ALL cached matches.
     for (const k of Object.keys(newMatches)) {
       newMatches[k].status = effectiveStatus(newMatches[k].date, newMatches[k].time, newMatches[k].status);
     }
