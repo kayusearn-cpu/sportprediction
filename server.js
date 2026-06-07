@@ -33,7 +33,6 @@
  *   FUTURE_REFRESH_MIN       tomorrow's cadence in minutes (default 60)
  *   PAST_REFRESH_MIN         yesterday's & primary's cadence (default 360)
  *   REFRESH_MINUTES          LEGACY — falls back into LIVE_REFRESH_MIN if set
- *   HISTORY_DAYS             how long to keep finished matches for H2H (default 60)
  *   ONLY_WITH_ODDS           "true" (default) = filter NS matches without odds
  *   ENABLE_PRIMARY           "true" = also scrape TARGET_URL (Forebet). Default: false.
  *   TARGET_URL               primary URL (only used if ENABLE_PRIMARY=true)
@@ -47,6 +46,7 @@
  *   TELEGRAM_ADMIN_ID        restricts the bot to you
  *   ADMIN_KEY                protects the /scrape-now URL
  *   CACHE_FILE               cache file path (default /tmp/sportprediction-cache.json)
+ *   HISTORY_DAYS             how long to keep finished matches for H2H (default 60)
  */
 
 const express = require('express');
@@ -93,6 +93,7 @@ const status = {
 };
 
 // Per-source status. Populated lazily as sources run.
+//   sourceState.today = { lastRun, lastOk, lastError, lastCount }
 const sourceState = {};
 
 // Only one scrape per source at a time, but different sources can run concurrently.
@@ -168,10 +169,12 @@ async function fetchPageHTML(targetUrl, useProxy) {
   return text;
 }
 
+// Detect a Cloudflare "Just a moment" interstitial.
 function isCloudflareChallenge(html) {
   return /just a moment|challenge-platform|cf-browser-verification|cf_chl_/i.test(html) && html.length < 80000;
 }
 
+// Plain HTTPS fetch — FREE, fast. Use first for any non-JS site (e.g. pitchpredictions).
 async function fetchPageDirect(targetUrl) {
   const { status: code, text } = await httpRequest('GET', targetUrl, {
     headers: {
@@ -185,6 +188,7 @@ async function fetchPageDirect(targetUrl) {
   return text;
 }
 
+// Strip scripts/styles/markup so the AI sees real content, not 600KB of noise.
 function htmlToText(html) {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -220,6 +224,7 @@ function predFrom(h, d, a) {
   if (max <= 0) return '';
   return max === h ? '1' : max === a ? '2' : 'X';
 }
+// Infer real status from kickoff time so the front-end can bucket matches correctly.
 function effectiveStatus(date, time, srcStatus) {
   if (srcStatus === 'FT') return 'FT';
   if (!date || !time) return srcStatus || 'NS';
@@ -274,6 +279,8 @@ function extractFromNextData(html) {
       time,
       homeTeam: (r.home_team && r.home_team.name) || '',
       awayTeam: (r.away_team && r.away_team.name) || '',
+      homeTeamId: (r.home_team && r.home_team.id != null) ? r.home_team.id : null,
+      awayTeamId: (r.away_team && r.away_team.id != null) ? r.away_team.id : null,
       homeLogo: (r.home_team && r.home_team.logo) || '',
       awayLogo: (r.away_team && r.away_team.logo) || '',
       score: liveScore,
@@ -404,8 +411,18 @@ function mergeIntoCache(list) {
       id: k,
       date: p.date || '',
       time: p.time || '',
-      home: { name: p.homeTeam, score: parseScore(p.score, 0), logo: p.homeLogo || '' },
-      away: { name: p.awayTeam, score: parseScore(p.score, 1), logo: p.awayLogo || '' },
+      home: {
+        name: p.homeTeam,
+        score: parseScore(p.score, 0),
+        logo: p.homeLogo || '',
+        id: p.homeTeamId != null ? p.homeTeamId : (prev.home && prev.home.id) || null,
+      },
+      away: {
+        name: p.awayTeam,
+        score: parseScore(p.score, 1),
+        logo: p.awayLogo || '',
+        id: p.awayTeamId != null ? p.awayTeamId : (prev.away && prev.away.id) || null,
+      },
       leagueName: p.league || '',
       leagueLogo: p.leagueLogo || '',
       status: p.status,
@@ -444,7 +461,7 @@ function mergeIntoCache(list) {
   for (const k of Object.keys(newMatches)) {
     newMatches[k].status = effectiveStatus(newMatches[k].date, newMatches[k].time, newMatches[k].status);
   }
-  // Eviction: finished matches kept for HISTORY_DAYS (build H2H), stale NS dropped after 48h.
+  // Eviction: finished matches kept HISTORY_DAYS (for H2H); stale NS dropped after 48h.
   const HISTORY_DAYS = parseInt(process.env.HISTORY_DAYS || '60', 10);
   const evictFinishedBefore = now - HISTORY_DAYS * 24 * 60 * 60 * 1000;
   const evictStaleBefore = now - 48 * 60 * 60 * 1000;
@@ -673,15 +690,22 @@ app.get('/scrape-now/:source', async (req, res) => {
 });
 
 // ---- Match detail endpoint: Last Matches + H2H + Form ----
-function teamMatches(teamName, limit = 10, excludeKey = null) {
-  if (!teamName) return [];
-  const norm = teamName.trim().toLowerCase();
+// Builds the details organically from our OWN cache (no extra scraping required).
+// Cache grows over HISTORY_DAYS so this becomes more useful every day.
+function teamMatches(teamName, teamId, limit = 10, excludeKey = null) {
+  if (!teamName && teamId == null) return [];
+  const norm = (teamName || '').trim().toLowerCase();
   const out = [];
   for (const k of Object.keys(store.matches)) {
     if (k === excludeKey) continue;
     const m = store.matches[k];
-    const isHome = (m.home && m.home.name || '').trim().toLowerCase() === norm;
-    const isAway = (m.away && m.away.name || '').trim().toLowerCase() === norm;
+    // Prefer ID match (robust); fall back to name match for older cached records that lack an ID.
+    const mhId = m.home && m.home.id != null ? m.home.id : null;
+    const maId = m.away && m.away.id != null ? m.away.id : null;
+    const isHome = (teamId != null && mhId != null) ? mhId === teamId
+                                                    : norm && (m.home && m.home.name || '').trim().toLowerCase() === norm;
+    const isAway = (teamId != null && maId != null) ? maId === teamId
+                                                    : norm && (m.away && m.away.name || '').trim().toLowerCase() === norm;
     if (!isHome && !isAway) continue;
     if (m.status !== 'FT') continue;
     const hs = m.home && m.home.score, as = m.away && m.away.score;
@@ -708,22 +732,29 @@ function teamMatches(teamName, limit = 10, excludeKey = null) {
   return out.slice(0, limit);
 }
 
-function h2hMatches(homeName, awayName, limit = 10, excludeKey = null) {
-  if (!homeName || !awayName) return [];
-  const h = homeName.trim().toLowerCase();
-  const a = awayName.trim().toLowerCase();
+function h2hMatches(homeName, awayName, homeId, awayId, limit = 10, excludeKey = null) {
+  if ((!homeName || !awayName) && (homeId == null || awayId == null)) return [];
+  const h = (homeName || '').trim().toLowerCase();
+  const a = (awayName || '').trim().toLowerCase();
   const out = [];
   for (const k of Object.keys(store.matches)) {
     if (k === excludeKey) continue;
     const m = store.matches[k];
     const hn = (m.home && m.home.name || '').trim().toLowerCase();
     const an = (m.away && m.away.name || '').trim().toLowerCase();
-    const sameMatchup = (hn === h && an === a) || (hn === a && an === h);
+    const mhId = m.home && m.home.id != null ? m.home.id : null;
+    const maId = m.away && m.away.id != null ? m.away.id : null;
+    let sameMatchup;
+    if (homeId != null && awayId != null && mhId != null && maId != null) {
+      sameMatchup = (mhId === homeId && maId === awayId) || (mhId === awayId && maId === homeId);
+    } else {
+      sameMatchup = (hn === h && an === a) || (hn === a && an === h);
+    }
     if (!sameMatchup) continue;
     if (m.status !== 'FT') continue;
     const hs = m.home && m.home.score, as = m.away && m.away.score;
     if (hs == null || as == null) continue;
-    const homeTeamWasHome = hn === h;
+    const homeTeamWasHome = (homeId != null && mhId != null) ? mhId === homeId : hn === h;
     const requestedHomeScore = homeTeamWasHome ? hs : as;
     const requestedAwayScore = homeTeamWasHome ? as : hs;
     const winner =
@@ -793,16 +824,25 @@ app.get('/api/match/:id/details', (req, res) => {
   const limit = Math.max(1, Math.min(20, parseInt(req.query.limit || '10', 10)));
   const homeName = m.home && m.home.name;
   const awayName = m.away && m.away.name;
-  const homeLast = teamMatches(homeName, limit, id);
-  const awayLast = teamMatches(awayName, limit, id);
-  const h2hList = h2hMatches(homeName, awayName, limit, id);
+  const homeId = m.home && m.home.id != null ? m.home.id : null;
+  const awayId = m.away && m.away.id != null ? m.away.id : null;
+  const homeLast = teamMatches(homeName, homeId, limit, id);
+  const awayLast = teamMatches(awayName, awayId, limit, id);
+  const h2hList = h2hMatches(homeName, awayName, homeId, awayId, limit, id);
   const stats = h2hStats(h2hList);
   const form = parseFormStats(m.recommendation || '');
+
+  // Cache diagnostic — helps you see how many FT matches are stored across the whole feed.
+  let totalFinished = 0;
+  for (const k of Object.keys(store.matches)) {
+    if (store.matches[k].status === 'FT' && store.matches[k].home && store.matches[k].home.score != null) totalFinished++;
+  }
+
   res.json({
     id,
     match: m,
-    home: { name: homeName, logo: m.home && m.home.logo, lastMatches: homeLast, form: form.home },
-    away: { name: awayName, logo: m.away && m.away.logo, lastMatches: awayLast, form: form.away },
+    home: { name: homeName, logo: m.home && m.home.logo, id: homeId, lastMatches: homeLast, form: form.home },
+    away: { name: awayName, logo: m.away && m.away.logo, id: awayId, lastMatches: awayLast, form: form.away },
     h2h: { matches: h2hList, stats },
     predictions: {
       probabilities: store.preds[id] ? { home: store.preds[id].h, draw: store.preds[id].d, away: store.preds[id].a } : null,
@@ -814,9 +854,10 @@ app.get('/api/match/:id/details', (req, res) => {
       recommendation: m.recommendation || '',
     },
     historyDays: parseInt(process.env.HISTORY_DAYS || '60', 10),
+    cacheStats: { totalMatches: Object.keys(store.matches).length, totalFinished },
     note:
       homeLast.length === 0 && awayLast.length === 0 && h2hList.length === 0
-        ? 'No history yet — cache is still building. Last Matches and H2H grow over the next 30 days as more matches finish.'
+        ? `No history yet for these teams. Cache holds ${totalFinished} finished match${totalFinished === 1 ? '' : 'es'}; H2H/form for small-league teams may stay sparse — the feature is most useful for top-flight clubs that play frequently.`
         : null,
   });
 });
