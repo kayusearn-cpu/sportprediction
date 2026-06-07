@@ -25,7 +25,7 @@
  *   2. Only if Cloudflare blocks us → fall back to Browserless.
  *   3. Parse __NEXT_DATA__ for matches (no AI cost).
  *   4. OpenAI fallback is only used when a source has no JSON at all (e.g. Forebet).
- *   5. Merge into the cache; persist to /tmp/sportprediction-cache.json.
+ *   5. Merge into the cache; persist to /tmp/sportprediction-cache.json (or CACHE_FILE).
  *
  * Env vars (all optional — defaults are sensible):
  *   PORT                     web port (Railway sets this)
@@ -46,13 +46,13 @@
  *   TELEGRAM_ADMIN_ID        restricts the bot to you
  *   ADMIN_KEY                protects the /scrape-now URL
  *   CACHE_FILE               cache file path (default /tmp/sportprediction-cache.json)
- *   HISTORY_DAYS             how long to keep finished matches for H2H (default 60)
  */
 
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
 const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
@@ -99,24 +99,61 @@ const sourceState = {};
 // Only one scrape per source at a time, but different sources can run concurrently.
 const runningSources = new Set();
 
+// Track where we're actually saving the cache. If the configured path (e.g. /data)
+// isn't writable — usually means a Railway Volume isn't attached yet — fall back to
+// /tmp so the cache still works inside this container (just won't persist across
+// redeploys until the volume is fixed).
+let activeCachePath = CACHE_FILE;
+let cacheFallbackWarned = false;
+
 function loadCache() {
-  try {
-    const raw = fs.readFileSync(CACHE_FILE, 'utf8');
-    const data = JSON.parse(raw);
-    if (data && data.matches && data.preds) {
-      store.matches = data.matches;
-      store.preds = data.preds;
-      status.lastCount = Object.keys(store.matches).length;
-      console.log(`[cache] loaded ${status.lastCount} matches from ${CACHE_FILE}`);
+  // Try the configured path first, then the /tmp fallback.
+  const candidates = [CACHE_FILE];
+  if (CACHE_FILE !== '/tmp/sportprediction-cache.json') candidates.push('/tmp/sportprediction-cache.json');
+  for (const p of candidates) {
+    try {
+      const raw = fs.readFileSync(p, 'utf8');
+      const data = JSON.parse(raw);
+      if (data && data.matches && data.preds) {
+        store.matches = data.matches;
+        store.preds = data.preds;
+        status.lastCount = Object.keys(store.matches).length;
+        activeCachePath = p;
+        console.log(`[cache] loaded ${status.lastCount} matches from ${p}`);
+        return;
+      }
+    } catch (e) {
+      /* try next candidate */
     }
-  } catch (e) {
-    /* no cache yet, or invalid — start fresh */
   }
+  console.log(`[cache] no cache found — starting fresh (target: ${CACHE_FILE})`);
 }
+
 function saveCache() {
+  // Ensure the directory exists. On a properly mounted volume this is a no-op.
   try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(store));
+    fs.mkdirSync(path.dirname(activeCachePath), { recursive: true });
   } catch (e) {
+    /* ignore — write attempt below will reveal the real error */
+  }
+  try {
+    fs.writeFileSync(activeCachePath, JSON.stringify(store));
+    return;
+  } catch (e) {
+    if (activeCachePath !== '/tmp/sportprediction-cache.json') {
+      if (!cacheFallbackWarned) {
+        console.error(`[cache] ${activeCachePath} unwritable (${e.message}). Falling back to /tmp — cache will reset on redeploy until you fix the Volume.`);
+        cacheFallbackWarned = true;
+      }
+      activeCachePath = '/tmp/sportprediction-cache.json';
+      try {
+        fs.writeFileSync(activeCachePath, JSON.stringify(store));
+        return;
+      } catch (e2) {
+        console.error('[cache] /tmp fallback also failed:', e2.message);
+        return;
+      }
+    }
     console.error('[cache] save failed:', e.message);
   }
 }
@@ -258,6 +295,8 @@ function extractFromNextData(html) {
     const liveAway = r.score && r.score.away;
     const liveScore = liveHome != null && liveAway != null ? `${liveHome}-${liveAway}` : '';
 
+    // Raw source status — pitchpredictions returns "NS" / "HT" / "FT" / numeric-string / "1H" / "2H".
+    // We need both: a normalised bucket (NS/LIVE/FT) AND the raw string for the live-minute timer.
     const srcS = String((r.match && r.match.status) || '').toUpperCase();
     let s;
     if (['NS', 'TBD', 'PST'].includes(srcS)) s = 'NS';
@@ -461,7 +500,6 @@ function mergeIntoCache(list) {
   for (const k of Object.keys(newMatches)) {
     newMatches[k].status = effectiveStatus(newMatches[k].date, newMatches[k].time, newMatches[k].status);
   }
-  // Eviction: finished matches kept HISTORY_DAYS (for H2H); stale NS dropped after 48h.
   const HISTORY_DAYS = parseInt(process.env.HISTORY_DAYS || '60', 10);
   const evictFinishedBefore = now - HISTORY_DAYS * 24 * 60 * 60 * 1000;
   const evictStaleBefore = now - 48 * 60 * 60 * 1000;
@@ -513,6 +551,7 @@ async function scrapeOne(src, trigger = 'scheduler') {
     if (isCloudflareChallenge(html)) {
       throw new Error('blocked by Cloudflare (even via Browserless)');
     }
+
     const list = await extractPredictions(html);
     console.log(`[scrape ${src.name}] ${html.length} bytes → ${list.length} matches`);
     if (!list.length) {
@@ -523,10 +562,12 @@ async function scrapeOne(src, trigger = 'scheduler') {
     st.lastOk = new Date().toISOString();
     st.lastError = null;
     st.lastCount = merged;
+
     status.lastOk = st.lastOk;
     status.lastRun = st.lastOk;
     status.lastError = null;
     status.lastCount = Object.keys(store.matches).length;
+
     saveCache();
     console.log(`[scrape ${src.name}] merged ${merged}; total cache ${status.lastCount}`);
     return { count: merged };
@@ -653,14 +694,12 @@ app.get('/api/health', (req, res) => {
     lastError: status.lastError,
     bootAt: status.bootAt,
     refreshMinutes: LIVE_REFRESH_MIN,
-    cadence: {
-      live: LIVE_REFRESH_MIN,
-      future: FUTURE_REFRESH_MIN,
-      past: PAST_REFRESH_MIN,
-    },
+    cadence: { live: LIVE_REFRESH_MIN, future: FUTURE_REFRESH_MIN, past: PAST_REFRESH_MIN },
     primaryEnabled: ENABLE_PRIMARY,
     target: TARGET_URL,
     fallback: FALLBACK_URL,
+    cacheFile: CACHE_FILE,
+    activeCachePath,
     sources,
   });
 });
@@ -690,8 +729,6 @@ app.get('/scrape-now/:source', async (req, res) => {
 });
 
 // ---- Match detail endpoint: Last Matches + H2H + Form ----
-// Builds the details organically from our OWN cache (no extra scraping required).
-// Cache grows over HISTORY_DAYS so this becomes more useful every day.
 function teamMatches(teamName, teamId, limit = 10, excludeKey = null) {
   if (!teamName && teamId == null) return [];
   const norm = (teamName || '').trim().toLowerCase();
@@ -699,7 +736,6 @@ function teamMatches(teamName, teamId, limit = 10, excludeKey = null) {
   for (const k of Object.keys(store.matches)) {
     if (k === excludeKey) continue;
     const m = store.matches[k];
-    // Prefer ID match (robust); fall back to name match for older cached records that lack an ID.
     const mhId = m.home && m.home.id != null ? m.home.id : null;
     const maId = m.away && m.away.id != null ? m.away.id : null;
     const isHome = (teamId != null && mhId != null) ? mhId === teamId
@@ -832,7 +868,6 @@ app.get('/api/match/:id/details', (req, res) => {
   const stats = h2hStats(h2hList);
   const form = parseFormStats(m.recommendation || '');
 
-  // Cache diagnostic — helps you see how many FT matches are stored across the whole feed.
   let totalFinished = 0;
   for (const k of Object.keys(store.matches)) {
     if (store.matches[k].status === 'FT' && store.matches[k].home && store.matches[k].home.score != null) totalFinished++;
