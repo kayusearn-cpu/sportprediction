@@ -1,15 +1,14 @@
 'use strict';
 
 /*
- * Football prediction scraper — smart tiered scheduler edition.
+ * Football prediction scraper — smart tiered scheduler edition with on-demand
+ * pitchpredictions H2H fetch + locked-down CORS.
  *
  *   TODAY      → every LIVE_REFRESH_MIN min  (default 10)
  *   TOMORROW   → every FUTURE_REFRESH_MIN min (default 60)
  *   YESTERDAY  → every PAST_REFRESH_MIN min   (default 360)
  *
- * Plus: on-demand H2H + last-6 fetch from pitchpredictions per-match pages.
- * That data is baked into __NEXT_DATA__ on the match detail page, so we get
- * real H2H instantly without waiting for our cache to grow.
+ * Set ALLOWED_ORIGINS in Railway env vars to lock the API to your domain only.
  */
 
 const express = require('express');
@@ -43,12 +42,15 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 const CACHE_FILE = process.env.CACHE_FILE || '/tmp/sportprediction-cache.json';
 
+// Comma-separated whitelist of origins allowed to call our API. Without this,
+// anyone can embed your Railway URL on their website and freeload off your data.
+// Set in Railway env vars, e.g.:
+//   ALLOWED_ORIGINS=https://magicbettingtips.com,https://magicbettingtips.netlify.app
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
 const store = { matches: {}, preds: {} };
-
-// Per-fixture URL map populated from listing scrapes.
 const matchUrls = {};
-
-// 24h cache for per-match H2H fetches.
 const matchDetailCache = new Map();
 const MATCH_DETAIL_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -253,6 +255,9 @@ function extractFromNextData(html) {
       htProbHome: htProbs ? htProbs.home : null,
       htProbDraw: htProbs ? htProbs.draw : null,
       htProbAway: htProbs ? htProbs.away : null,
+      oddsHome:  parseFloat(r.odds && r.odds.home) || null,
+      oddsDraw:  parseFloat(r.odds && r.odds.draw) || null,
+      oddsAway:  parseFloat(r.odds && r.odds.away) || null,
     };
   });
 }
@@ -353,6 +358,9 @@ function mergeIntoCache(list) {
       htProbHome: p.htProbHome != null ? p.htProbHome : prev.htProbHome,
       htProbDraw: p.htProbDraw != null ? p.htProbDraw : prev.htProbDraw,
       htProbAway: p.htProbAway != null ? p.htProbAway : prev.htProbAway,
+      oddsHome:   p.oddsHome   != null ? p.oddsHome   : prev.oddsHome,
+      oddsDraw:   p.oddsDraw   != null ? p.oddsDraw   : prev.oddsDraw,
+      oddsAway:   p.oddsAway   != null ? p.oddsAway   : prev.oddsAway,
       lastSeenAt: Date.now(),
     };
     newPreds[k] = {
@@ -406,7 +414,6 @@ async function scrapeOne(src, trigger = 'scheduler') {
     }
     if (isCloudflareChallenge(html)) throw new Error('blocked by Cloudflare (even via Browserless)');
 
-    // Harvest per-match URLs (used for on-demand H2H fetch).
     const urlRegex = /href="(\/match\/football-predictions-[^"]+?-(\d+)\/matches)"/g;
     let _u;
     while ((_u = urlRegex.exec(html)) !== null) {
@@ -506,8 +513,38 @@ async function pollTelegram() {
 }
 
 const app = express();
-app.use(cors());
+
+// STRICT CORS — only listed origins. Browsers on other sites get blocked.
+//   - If ALLOWED_ORIGINS is empty, we allow all (good for dev / first deploy).
+//   - Once you set ALLOWED_ORIGINS in Railway env vars, ONLY those origins work.
+app.use(cors({
+  origin: (origin, callback) => {
+    if (ALLOWED_ORIGINS.length === 0) return callback(null, true);     // unrestricted before configuring
+    if (!origin) return callback(null, true);                          // non-browser callers (uptime monitor, etc.) handled by originGate below
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn(`[cors] blocked origin: ${origin}`);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: false,
+}));
+
 app.use(express.json());
+
+// Origin/Referer gate for DATA endpoints. Blocks:
+//   1. Curl/Postman without Origin (no Referer either) → 403
+//   2. Server-to-server scrapers that copy your Railway URL → 403
+//   3. Other domains spoofing CORS via residential proxies (Origin won't match) → 403
+// Public endpoints (/, /api/health, /scrape-now) skip this so UptimeRobot still works.
+function originGate(req, res, next) {
+  if (ALLOWED_ORIGINS.length === 0) return next();   // unrestricted in dev
+  const origin = req.headers.origin || '';
+  const referer = req.headers.referer || '';
+  const okOrigin  = origin  && ALLOWED_ORIGINS.includes(origin);
+  const okReferer = referer && ALLOWED_ORIGINS.some(o => referer.startsWith(o));
+  if (okOrigin || okReferer) return next();
+  console.warn(`[block] path=${req.path} origin=${origin || 'NONE'} referer=${referer || 'NONE'}`);
+  return res.status(403).json({ error: 'forbidden — invalid origin' });
+}
 
 app.get('/', (req, res) =>
   res.json({ ok: true, service: 'prediction-scraper', matches: Object.keys(store.matches).length })
@@ -530,11 +567,12 @@ app.get('/api/health', (req, res) => {
     cacheFile: CACHE_FILE, activeCachePath,
     matchUrlsHarvested: Object.keys(matchUrls).length,
     h2hCacheSize: matchDetailCache.size,
+    allowedOrigins: ALLOWED_ORIGINS.length || 'unrestricted',
     sources,
   });
 });
 
-app.get('/api/scores', (req, res) => {
+app.get('/api/scores', originGate, (req, res) => {
   const matches = Object.entries(store.matches).map(([key, m]) => {
     const p = store.preds[key];
     return {
@@ -558,7 +596,6 @@ app.get('/scrape-now/:source', async (req, res) => {
   res.json(await scrapeOne(src, 'http'));
 });
 
-// ---- Match detail: Last Matches + H2H + Form ----
 function teamMatches(teamName, teamId, limit = 10, excludeKey = null) {
   if (!teamName && teamId == null) return [];
   const norm = (teamName || '').trim().toLowerCase();
@@ -666,7 +703,6 @@ function parseFormStats(text) {
   return { home: Object.keys(home).length ? home : null, away: Object.keys(away).length ? away : null };
 }
 
-// ---- On-demand H2H + last matches from pitchpredictions per-match page ----
 function slugifyForPP(name) {
   if (!name) return '';
   return name.trim()
@@ -776,7 +812,7 @@ function convertPpLast(m, teamName, teamId) {
   };
 }
 
-app.get('/api/match/:id/details', async (req, res) => {
+app.get('/api/match/:id/details', originGate, async (req, res) => {
   const id = decodeURIComponent(req.params.id || '');
   const m = store.matches[id];
   if (!m) return res.status(404).json({ error: 'match not found', id });
@@ -792,7 +828,6 @@ app.get('/api/match/:id/details', async (req, res) => {
   let h2hList = h2hMatches(homeName, awayName, homeId, awayId, limit, id);
   let externalSource = null;
 
-  // On-demand fetch from pitchpredictions if any section is empty.
   if (fixtureId && (homeLast.length === 0 || awayLast.length === 0 || h2hList.length === 0)) {
     try {
       const ext = await fetchPPMatchDetails(fixtureId, homeName, awayName);
@@ -850,6 +885,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   cadence: live=${LIVE_REFRESH_MIN}min  future=${FUTURE_REFRESH_MIN}min  past=${PAST_REFRESH_MIN}min`);
   console.log(`   primary: ${ENABLE_PRIMARY ? 'ENABLED (' + TARGET_URL + ')' : 'disabled'}`);
   console.log(`   fallback=${FALLBACK_URL}  browserless=${BROWSERLESS_HOST}`);
+  console.log(`   allowed origins: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : 'UNRESTRICTED (set ALLOWED_ORIGINS to lock down)'}`);
   loadCache();
   startTieredScheduler();
   if (TG_TOKEN) pollTelegram();
