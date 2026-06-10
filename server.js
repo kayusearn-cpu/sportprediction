@@ -524,7 +524,22 @@ app.use(cors({
   credentials: false,
 }));
 
-app.use(express.json());
+// Hard 10 KB cap on JSON body — we don't accept big payloads, so cut DOS vectors.
+app.use(express.json({ limit: '10kb' }));
+
+// Security headers — block common XSS, clickjacking, MIME-sniffing attacks.
+// All standard headers, no new dependencies needed.
+app.use((req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'X-XSS-Protection': '1; mode=block',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+    'Permissions-Policy': 'geolocation=(), microphone=(), camera=()',
+  });
+  next();
+});
 
 function originGate(req, res, next) {
   if (ALLOWED_ORIGINS.length === 0) return next();
@@ -542,6 +557,8 @@ app.get('/', (req, res) =>
 );
 
 app.get('/api/health', (req, res) => {
+  // No-cache: UptimeRobot and admin diagnostics need real-time status.
+  res.set('Cache-Control', 'no-store, max-age=0');
   const sources = getSources().map((s) => ({
     name: s.name, tier: s.tier, intervalMin: s.intervalMin,
     useBrowser: s.useBrowser, ...sourceState[s.name],
@@ -564,6 +581,9 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/api/scores', originGate, (req, res) => {
+  // 60-second cache. Browsers + Cloudflare/Netlify CDN reuse this response,
+  // dropping Railway load by ~99% under high traffic.
+  res.set('Cache-Control', 'public, max-age=60, s-maxage=60, stale-while-revalidate=30');
   const matches = Object.entries(store.matches).map(([key, m]) => {
     const p = store.preds[key];
     return {
@@ -583,7 +603,7 @@ app.get('/scrape-now', async (req, res) => {
 app.get('/scrape-now/:source', async (req, res) => {
   if (ADMIN_KEY && req.query.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
   const src = getSources().find((s) => s.name === req.params.source);
-  if (!src) return res.status(404).json({ error: `unknown source "${req.params.source}"` });
+  if (!src) return res.status(404).json({ error: `unknown source` });
   res.json(await scrapeOne(src, 'http'));
 });
 
@@ -805,8 +825,16 @@ function convertPpLast(m, teamName, teamId) {
 
 app.get('/api/match/:id/details', originGate, async (req, res) => {
   const id = decodeURIComponent(req.params.id || '');
+  // Input validation — reject suspiciously long or weird IDs early.
+  if (!id || id.length > 200 || /[<>"'`{}]/.test(id)) {
+    return res.status(400).json({ error: 'invalid id' });
+  }
   const m = store.matches[id];
-  if (!m) return res.status(404).json({ error: 'match not found', id });
+  if (!m) return res.status(404).json({ error: 'match not found' });
+  // 5-minute cache. H2H + last-6 history rarely changes; this drastically
+  // cuts both our backend load AND pitchpredictions hits when many users
+  // open the same match modal.
+  res.set('Cache-Control', 'public, max-age=300, s-maxage=300, stale-while-revalidate=60');
   const limit = Math.max(1, Math.min(20, parseInt(req.query.limit || '10', 10)));
   const homeName = m.home && m.home.name;
   const awayName = m.away && m.away.name;
