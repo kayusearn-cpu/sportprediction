@@ -1,14 +1,13 @@
 'use strict';
 
 /*
- * Football prediction scraper — smart tiered scheduler edition with on-demand
- * pitchpredictions H2H fetch + locked-down CORS.
+ * Football prediction scraper — smart tiered scheduler edition.
  *
- *   TODAY      → every LIVE_REFRESH_MIN min  (default 10)
+ *   TODAY      → every LIVE_REFRESH_MIN min  (default 5)
  *   TOMORROW   → every FUTURE_REFRESH_MIN min (default 60)
- *   YESTERDAY  → every PAST_REFRESH_MIN min   (default 360)
+ *   YESTERDAY  → every PAST_REFRESH_MIN min   (default 360 = 6h)
  *
- * Set ALLOWED_ORIGINS in Railway env vars to lock the API to your domain only.
+ * Lock the API to your domain with ALLOWED_ORIGINS env var on Railway.
  */
 
 const express = require('express');
@@ -20,7 +19,9 @@ const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
 
-const LEGACY_REFRESH = parseInt(process.env.REFRESH_MINUTES || '10', 10);
+// LIVE_REFRESH_MIN bumped from 10 → 5 so live scores update twice as fast.
+// Still free (plain HTTPS to pitchpredictions, no Browserless token cost).
+const LEGACY_REFRESH = parseInt(process.env.REFRESH_MINUTES || '5', 10);
 const LIVE_REFRESH_MIN = parseInt(process.env.LIVE_REFRESH_MIN || String(LEGACY_REFRESH), 10);
 const FUTURE_REFRESH_MIN = parseInt(process.env.FUTURE_REFRESH_MIN || '60', 10);
 const PAST_REFRESH_MIN = parseInt(process.env.PAST_REFRESH_MIN || '360', 10);
@@ -42,10 +43,8 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 const CACHE_FILE = process.env.CACHE_FILE || '/tmp/sportprediction-cache.json';
 
-// Comma-separated whitelist of origins allowed to call our API. Without this,
-// anyone can embed your Railway URL on their website and freeload off your data.
-// Set in Railway env vars, e.g.:
-//   ALLOWED_ORIGINS=https://magicbettingtips.com,https://magicbettingtips.netlify.app
+// Comma-separated whitelist of origins allowed to call our API.
+// Example: ALLOWED_ORIGINS=https://www.magicbettingtips.com,https://magicbettingtips.com
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -80,7 +79,7 @@ function loadCache() {
         console.log(`[cache] loaded ${status.lastCount} matches from ${p}`);
         return;
       }
-    } catch (e) { /* try next */ }
+    } catch (e) {}
   }
   console.log(`[cache] no cache found — starting fresh (target: ${CACHE_FILE})`);
 }
@@ -358,9 +357,9 @@ function mergeIntoCache(list) {
       htProbHome: p.htProbHome != null ? p.htProbHome : prev.htProbHome,
       htProbDraw: p.htProbDraw != null ? p.htProbDraw : prev.htProbDraw,
       htProbAway: p.htProbAway != null ? p.htProbAway : prev.htProbAway,
-      oddsHome:   p.oddsHome   != null ? p.oddsHome   : prev.oddsHome,
-      oddsDraw:   p.oddsDraw   != null ? p.oddsDraw   : prev.oddsDraw,
-      oddsAway:   p.oddsAway   != null ? p.oddsAway   : prev.oddsAway,
+      oddsHome: p.oddsHome != null ? p.oddsHome : prev.oddsHome,
+      oddsDraw: p.oddsDraw != null ? p.oddsDraw : prev.oddsDraw,
+      oddsAway: p.oddsAway != null ? p.oddsAway : prev.oddsAway,
       lastSeenAt: Date.now(),
     };
     newPreds[k] = {
@@ -514,13 +513,10 @@ async function pollTelegram() {
 
 const app = express();
 
-// STRICT CORS — only listed origins. Browsers on other sites get blocked.
-//   - If ALLOWED_ORIGINS is empty, we allow all (good for dev / first deploy).
-//   - Once you set ALLOWED_ORIGINS in Railway env vars, ONLY those origins work.
 app.use(cors({
   origin: (origin, callback) => {
-    if (ALLOWED_ORIGINS.length === 0) return callback(null, true);     // unrestricted before configuring
-    if (!origin) return callback(null, true);                          // non-browser callers (uptime monitor, etc.) handled by originGate below
+    if (ALLOWED_ORIGINS.length === 0) return callback(null, true);
+    if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
     console.warn(`[cors] blocked origin: ${origin}`);
     return callback(new Error('Not allowed by CORS'));
@@ -530,13 +526,8 @@ app.use(cors({
 
 app.use(express.json());
 
-// Origin/Referer gate for DATA endpoints. Blocks:
-//   1. Curl/Postman without Origin (no Referer either) → 403
-//   2. Server-to-server scrapers that copy your Railway URL → 403
-//   3. Other domains spoofing CORS via residential proxies (Origin won't match) → 403
-// Public endpoints (/, /api/health, /scrape-now) skip this so UptimeRobot still works.
 function originGate(req, res, next) {
-  if (ALLOWED_ORIGINS.length === 0) return next();   // unrestricted in dev
+  if (ALLOWED_ORIGINS.length === 0) return next();
   const origin = req.headers.origin || '';
   const referer = req.headers.referer || '';
   const okOrigin  = origin  && ALLOWED_ORIGINS.includes(origin);
