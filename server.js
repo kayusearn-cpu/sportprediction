@@ -3,13 +3,14 @@
 /*
  * Football prediction scraper — smart tiered scheduler edition.
  *
- *   TODAY      → every LIVE_REFRESH_MIN min  (default 10)
+ *   TODAY      → every LIVE_REFRESH_MIN min  (default 5)
  *   TOMORROW   → every FUTURE_REFRESH_MIN min (default 60)
- *   YESTERDAY  → every PAST_REFRESH_MIN min   (default 360)
+ *   WEEKEND    → every FUTURE_REFRESH_MIN min (default 60) — extra coverage
+ *   YESTERDAY  → every PAST_REFRESH_MIN min   (default 360 = 6h)
+ *   COUNTRY    → 5+ country pages, 60 min each (~50 matches per country)
  *
- * Plus: on-demand H2H + last-6 fetch from pitchpredictions per-match pages.
- * That data is baked into __NEXT_DATA__ on the match detail page, so we get
- * real H2H instantly without waiting for our cache to grow.
+ * Set ALLOWED_ORIGINS in Railway env vars to lock the API to your domain only.
+ * Set COUNTRY_FEEDS to control which country feeds to scrape.
  */
 
 const express = require('express');
@@ -21,7 +22,7 @@ const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
 
-const LEGACY_REFRESH = parseInt(process.env.REFRESH_MINUTES || '10', 10);
+const LEGACY_REFRESH = parseInt(process.env.REFRESH_MINUTES || '5', 10);
 const LIVE_REFRESH_MIN = parseInt(process.env.LIVE_REFRESH_MIN || String(LEGACY_REFRESH), 10);
 const FUTURE_REFRESH_MIN = parseInt(process.env.FUTURE_REFRESH_MIN || '60', 10);
 const PAST_REFRESH_MIN = parseInt(process.env.PAST_REFRESH_MIN || '360', 10);
@@ -43,12 +44,11 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 const CACHE_FILE = process.env.CACHE_FILE || '/tmp/sportprediction-cache.json';
 
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
 const store = { matches: {}, preds: {} };
-
-// Per-fixture URL map populated from listing scrapes.
 const matchUrls = {};
-
-// 24h cache for per-match H2H fetches.
 const matchDetailCache = new Map();
 const MATCH_DETAIL_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -78,7 +78,7 @@ function loadCache() {
         console.log(`[cache] loaded ${status.lastCount} matches from ${p}`);
         return;
       }
-    } catch (e) { /* try next */ }
+    } catch (e) {}
   }
   console.log(`[cache] no cache found — starting fresh (target: ${CACHE_FILE})`);
 }
@@ -253,6 +253,9 @@ function extractFromNextData(html) {
       htProbHome: htProbs ? htProbs.home : null,
       htProbDraw: htProbs ? htProbs.draw : null,
       htProbAway: htProbs ? htProbs.away : null,
+      oddsHome:  parseFloat(r.odds && r.odds.home) || null,
+      oddsDraw:  parseFloat(r.odds && r.odds.draw) || null,
+      oddsAway:  parseFloat(r.odds && r.odds.away) || null,
     };
   });
 }
@@ -300,13 +303,28 @@ function parseScore(score, idx) {
   return m ? parseInt(m[idx + 1], 10) : null;
 }
 
+// Country pages return ~50 matches each across ~5 days ahead. Comma-separated.
+const COUNTRY_FEEDS = (process.env.COUNTRY_FEEDS || 'argentina,brazil,sweden,norway,spain')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
 function getSources() {
   const PP = 'https://www.pitchpredictions.com';
   const list = [
     { name: 'today',     url: FALLBACK_URL || PP,                     useBrowser: false, intervalMin: LIVE_REFRESH_MIN,   tier: 'live'   },
     { name: 'tomorrow',  url: PP + '/football-predictions-tomorrow',  useBrowser: false, intervalMin: FUTURE_REFRESH_MIN, tier: 'future' },
+    { name: 'weekend',   url: PP + '/football-predictions-weekend',   useBrowser: false, intervalMin: FUTURE_REFRESH_MIN, tier: 'future' },
     { name: 'yesterday', url: PP + '/football-predictions-yesterday', useBrowser: false, intervalMin: PAST_REFRESH_MIN,   tier: 'past'   },
   ];
+  // Country feeds — give ~50 matches each across ~5 days, big boost to total coverage.
+  for (const country of COUNTRY_FEEDS) {
+    list.push({
+      name: `country-${country}`,
+      url: `${PP}/country/football-predictions-for-${country}/fixtures`,
+      useBrowser: false,
+      intervalMin: FUTURE_REFRESH_MIN,
+      tier: 'future',
+    });
+  }
   if (ENABLE_PRIMARY && TARGET_URL) {
     list.push({ name: 'primary', url: TARGET_URL, useBrowser: true, useProxy: true, intervalMin: PAST_REFRESH_MIN, tier: 'primary' });
   }
@@ -353,6 +371,9 @@ function mergeIntoCache(list) {
       htProbHome: p.htProbHome != null ? p.htProbHome : prev.htProbHome,
       htProbDraw: p.htProbDraw != null ? p.htProbDraw : prev.htProbDraw,
       htProbAway: p.htProbAway != null ? p.htProbAway : prev.htProbAway,
+      oddsHome: p.oddsHome != null ? p.oddsHome : prev.oddsHome,
+      oddsDraw: p.oddsDraw != null ? p.oddsDraw : prev.oddsDraw,
+      oddsAway: p.oddsAway != null ? p.oddsAway : prev.oddsAway,
       lastSeenAt: Date.now(),
     };
     newPreds[k] = {
@@ -406,7 +427,6 @@ async function scrapeOne(src, trigger = 'scheduler') {
     }
     if (isCloudflareChallenge(html)) throw new Error('blocked by Cloudflare (even via Browserless)');
 
-    // Harvest per-match URLs (used for on-demand H2H fetch).
     const urlRegex = /href="(\/match\/football-predictions-[^"]+?-(\d+)\/matches)"/g;
     let _u;
     while ((_u = urlRegex.exec(html)) !== null) {
@@ -447,7 +467,7 @@ function startTieredScheduler() {
   const sources = getSources();
   console.log(`[scheduler] ${sources.length} source(s) scheduled:`);
   sources.forEach((src, i) => {
-    console.log(`   ${src.name.padEnd(10)} every ${String(src.intervalMin).padStart(4)} min  (${src.useBrowser ? 'browser' : 'direct '})  tier=${src.tier}`);
+    console.log(`   ${src.name.padEnd(20)} every ${String(src.intervalMin).padStart(4)} min  (${src.useBrowser ? 'browser' : 'direct '})  tier=${src.tier}`);
     setTimeout(() => scrapeOne(src, 'boot'), 3000 + i * 4000);
     setInterval(() => scrapeOne(src, 'scheduler'), src.intervalMin * 60 * 1000);
   });
@@ -506,14 +526,49 @@ async function pollTelegram() {
 }
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (ALLOWED_ORIGINS.length === 0) return callback(null, true);
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn(`[cors] blocked origin: ${origin}`);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: false,
+}));
+
+app.use(express.json({ limit: '10kb' }));
+
+app.use((req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'X-XSS-Protection': '1; mode=block',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+    'Permissions-Policy': 'geolocation=(), microphone=(), camera=()',
+  });
+  next();
+});
+
+function originGate(req, res, next) {
+  if (ALLOWED_ORIGINS.length === 0) return next();
+  const origin = req.headers.origin || '';
+  const referer = req.headers.referer || '';
+  const okOrigin  = origin  && ALLOWED_ORIGINS.includes(origin);
+  const okReferer = referer && ALLOWED_ORIGINS.some(o => referer.startsWith(o));
+  if (okOrigin || okReferer) return next();
+  console.warn(`[block] path=${req.path} origin=${origin || 'NONE'} referer=${referer || 'NONE'}`);
+  return res.status(403).json({ error: 'forbidden — invalid origin' });
+}
 
 app.get('/', (req, res) =>
   res.json({ ok: true, service: 'prediction-scraper', matches: Object.keys(store.matches).length })
 );
 
 app.get('/api/health', (req, res) => {
+  res.set('Cache-Control', 'no-store, max-age=0');
   const sources = getSources().map((s) => ({
     name: s.name, tier: s.tier, intervalMin: s.intervalMin,
     useBrowser: s.useBrowser, ...sourceState[s.name],
@@ -526,15 +581,18 @@ app.get('/api/health', (req, res) => {
     refreshMinutes: LIVE_REFRESH_MIN,
     cadence: { live: LIVE_REFRESH_MIN, future: FUTURE_REFRESH_MIN, past: PAST_REFRESH_MIN },
     primaryEnabled: ENABLE_PRIMARY,
+    countryFeeds: COUNTRY_FEEDS,
     target: TARGET_URL, fallback: FALLBACK_URL,
     cacheFile: CACHE_FILE, activeCachePath,
     matchUrlsHarvested: Object.keys(matchUrls).length,
     h2hCacheSize: matchDetailCache.size,
+    allowedOrigins: ALLOWED_ORIGINS.length || 'unrestricted',
     sources,
   });
 });
 
-app.get('/api/scores', (req, res) => {
+app.get('/api/scores', originGate, (req, res) => {
+  res.set('Cache-Control', 'public, max-age=60, s-maxage=60, stale-while-revalidate=30');
   const matches = Object.entries(store.matches).map(([key, m]) => {
     const p = store.preds[key];
     return {
@@ -554,11 +612,10 @@ app.get('/scrape-now', async (req, res) => {
 app.get('/scrape-now/:source', async (req, res) => {
   if (ADMIN_KEY && req.query.key !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
   const src = getSources().find((s) => s.name === req.params.source);
-  if (!src) return res.status(404).json({ error: `unknown source "${req.params.source}"` });
+  if (!src) return res.status(404).json({ error: `unknown source` });
   res.json(await scrapeOne(src, 'http'));
 });
 
-// ---- Match detail: Last Matches + H2H + Form ----
 function teamMatches(teamName, teamId, limit = 10, excludeKey = null) {
   if (!teamName && teamId == null) return [];
   const norm = (teamName || '').trim().toLowerCase();
@@ -666,7 +723,6 @@ function parseFormStats(text) {
   return { home: Object.keys(home).length ? home : null, away: Object.keys(away).length ? away : null };
 }
 
-// ---- On-demand H2H + last matches from pitchpredictions per-match page ----
 function slugifyForPP(name) {
   if (!name) return '';
   return name.trim()
@@ -720,13 +776,23 @@ async function fetchPPMatchDetails(fixtureId, homeName, awayName) {
   const pp = data && data.props && data.props.pageProps;
   if (!pp) return null;
 
+  // Standings comes back as a JSON-encoded string. Parse it so frontend gets real data.
+  let standings = null;
+  if (typeof pp.initialStandings === 'string' && pp.initialStandings.trim().startsWith('[')) {
+    try { standings = JSON.parse(pp.initialStandings); } catch (e) { standings = null; }
+  } else if (Array.isArray(pp.initialStandings)) {
+    standings = pp.initialStandings;
+  }
+
   const out = {
     h2hMatches: Array.isArray(pp.initialH2HMatches) ? pp.initialH2HMatches : [],
     homeLast: Array.isArray(pp.initialHomeLast6) ? pp.initialHomeLast6 : [],
     awayLast: Array.isArray(pp.initialAwayLast6) ? pp.initialAwayLast6 : [],
+    standings,
   };
   matchDetailCache.set(String(fixtureId), { fetchedAt: Date.now(), data: out });
-  console.log(`[pp-details] cached ${fixtureId} — h2h=${out.h2hMatches.length} homeLast=${out.homeLast.length} awayLast=${out.awayLast.length}`);
+  const stStr = standings ? `standings=${standings.length}group(s)` : 'no-standings';
+  console.log(`[pp-details] cached ${fixtureId} — h2h=${out.h2hMatches.length} homeLast=${out.homeLast.length} awayLast=${out.awayLast.length} ${stStr}`);
   return out;
 }
 
@@ -776,10 +842,14 @@ function convertPpLast(m, teamName, teamId) {
   };
 }
 
-app.get('/api/match/:id/details', async (req, res) => {
+app.get('/api/match/:id/details', originGate, async (req, res) => {
   const id = decodeURIComponent(req.params.id || '');
+  if (!id || id.length > 200 || /[<>"'`{}]/.test(id)) {
+    return res.status(400).json({ error: 'invalid id' });
+  }
   const m = store.matches[id];
-  if (!m) return res.status(404).json({ error: 'match not found', id });
+  if (!m) return res.status(404).json({ error: 'match not found' });
+  res.set('Cache-Control', 'public, max-age=300, s-maxage=300, stale-while-revalidate=60');
   const limit = Math.max(1, Math.min(20, parseInt(req.query.limit || '10', 10)));
   const homeName = m.home && m.home.name;
   const awayName = m.away && m.away.name;
@@ -791,9 +861,11 @@ app.get('/api/match/:id/details', async (req, res) => {
   let awayLast = teamMatches(awayName, awayId, limit, id);
   let h2hList = h2hMatches(homeName, awayName, homeId, awayId, limit, id);
   let externalSource = null;
+  let standings = null;
 
-  // On-demand fetch from pitchpredictions if any section is empty.
-  if (fixtureId && (homeLast.length === 0 || awayLast.length === 0 || h2hList.length === 0)) {
+  // Always call fetchPPMatchDetails when we have a fixture_id — STANDINGS data
+  // only comes from per-match pages. The 24h cache prevents abuse.
+  if (fixtureId) {
     try {
       const ext = await fetchPPMatchDetails(fixtureId, homeName, awayName);
       if (ext) {
@@ -809,6 +881,30 @@ app.get('/api/match/:id/details', async (req, res) => {
         if (awayLast.length === 0 && ext.awayLast.length) {
           awayLast = ext.awayLast.map((x) => convertPpLast(x, awayName, awayId))
             .filter(Boolean).sort((a, b) => b.kickoffMs - a.kickoffMs).slice(0, limit);
+        }
+        // Trim standings to essentials so we don't ship a huge payload.
+        if (Array.isArray(ext.standings) && ext.standings.length) {
+          standings = ext.standings.map((group) =>
+            (Array.isArray(group) ? group : []).map((row) => ({
+              rank: row.rank,
+              teamId: row.team && row.team.id,
+              teamName: row.team && row.team.name,
+              teamLogo: row.team && row.team.logo,
+              group: row.group || '',
+              played: row.all && row.all.played,
+              win: row.all && row.all.win,
+              draw: row.all && row.all.draw,
+              lose: row.all && row.all.lose,
+              gf: row.all && row.all.goals && row.all.goals.for,
+              ga: row.all && row.all.goals && row.all.goals.against,
+              gd: row.goalsDiff,
+              points: row.points,
+              form: row.form || '',
+              description: row.description || '',
+              isHomeTeam: row.team && row.team.id === homeId,
+              isAwayTeam: row.team && row.team.id === awayId,
+            }))
+          );
         }
       }
     } catch (e) { console.error('[pp-details] error:', e.message); }
@@ -836,6 +932,7 @@ app.get('/api/match/:id/details', async (req, res) => {
       avgGoals: m.avgGoals,
       recommendation: m.recommendation || '',
     },
+    standings,
     historyDays: parseInt(process.env.HISTORY_DAYS || '60', 10),
     cacheStats: { totalMatches: Object.keys(store.matches).length, totalFinished },
     externalSource,
@@ -849,7 +946,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`⚽ Prediction scraper live on :${PORT}`);
   console.log(`   cadence: live=${LIVE_REFRESH_MIN}min  future=${FUTURE_REFRESH_MIN}min  past=${PAST_REFRESH_MIN}min`);
   console.log(`   primary: ${ENABLE_PRIMARY ? 'ENABLED (' + TARGET_URL + ')' : 'disabled'}`);
+  console.log(`   country feeds: ${COUNTRY_FEEDS.length ? COUNTRY_FEEDS.join(', ') : 'none'}`);
   console.log(`   fallback=${FALLBACK_URL}  browserless=${BROWSERLESS_HOST}`);
+  console.log(`   allowed origins: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : 'UNRESTRICTED'}`);
   loadCache();
   startTieredScheduler();
   if (TG_TOKEN) pollTelegram();
