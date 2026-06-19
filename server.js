@@ -330,6 +330,16 @@ function extractFromNextData(html) {
     const dc = r.predictions && r.predictions.double_chance;
     const htProbs = r.predictions && r.predictions.half_time;
 
+    // Country lives on the league object on pitchpredictions. The exact key
+    // varies a bit across endpoints — check them all and fall back to top-level
+    // r.country if present. This kills the league→country guesswork on the
+    // frontend so the slider can show whatever the source actually labels.
+    const country =
+      (r.league && (r.league.country || r.league.country_name || r.league.countryName)) ||
+      r.country ||
+      r.country_name ||
+      '';
+
     return {
       // existing fields
       date,
@@ -344,6 +354,8 @@ function extractFromNextData(html) {
       status: s,
       league: (r.league && r.league.name) || '',
       leagueLogo: (r.league && (r.league.logo || r.league.downloaded_league_logo)) || '',
+      country,
+      countryFlag: (r.league && (r.league.flag || r.league.country_flag)) || '',
       prediction,
       correctScore: '',
       probHome: h,
@@ -506,6 +518,8 @@ function mergeIntoCache(list) {
       },
       leagueName: p.league || '',
       leagueLogo: p.leagueLogo || '',
+      country: p.country || prev.country || '',
+      countryFlag: p.countryFlag || prev.countryFlag || '',
       status: p.status,
       prediction: p.prediction || '',
       correctScore: p.correctScore || '',
