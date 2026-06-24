@@ -97,10 +97,12 @@ const store = { matches: {}, preds: {} };
 // + last-matches data on demand when a user opens the detail modal.
 const matchUrls = {};
 
-// Cache for per-match H2H scrapes — 24 h TTL. Avoids hammering pitchpredictions
-// when the same match modal is opened many times.
+// Cache for per-match H2H + standings scrapes — 6 h TTL so league standings stay
+// current through the day (they were going stale on a 24 h cache, showing old
+// matchday tables). Still avoids hammering pitchpredictions when the same match
+// modal is opened many times.
 const matchDetailCache = new Map();  // fixtureId -> { fetchedAt, data }
-const MATCH_DETAIL_TTL_MS = 24 * 60 * 60 * 1000;
+const MATCH_DETAIL_TTL_MS = 6 * 60 * 60 * 1000;
 
 // Global status (last successful scrape across ANY source).
 const status = {
@@ -278,6 +280,19 @@ function predFrom(h, d, a) {
   if (max <= 0) return '';
   return max === h ? '1' : max === a ? '2' : 'X';
 }
+// Use pitchpredictions' bookmaker odds when present; otherwise derive "fair odds"
+// from the model's 1X2 percentage so EVERY match shows odds. Most lower-tier / live
+// / country-feed fixtures arrive with null odds — this fills the gap and keeps the
+// figure consistent with the % shown on the card (1/odd ≈ pct). Clamped to a sane
+// 1.01–51 range so a 2% pick doesn't render as 50.0.
+function oddsOrFair(raw, pct) {
+  const real = parseFloat(raw);
+  if (real > 1) return real;
+  const p = parseInt(pct, 10);
+  if (!(p > 0)) return null;
+  const fair = 100 / p;
+  return Math.round(Math.min(Math.max(fair, 1.01), 51) * 100) / 100;
+}
 // Infer real status from kickoff time so the front-end can bucket matches correctly.
 function effectiveStatus(date, time, srcStatus) {
   if (srcStatus === 'FT') return 'FT';
@@ -296,7 +311,13 @@ function extractFromNextData(html) {
   try { data = JSON.parse(m[1]); } catch (e) { return []; }
   const rows = data && data.props && data.props.pageProps && data.props.pageProps.initialData;
   if (!Array.isArray(rows)) return [];
-  return rows.map((r) => {
+  return rows.map(mapFixtureRow);
+}
+
+// Map ONE pitchpredictions fixture object into our normalized prediction record.
+// The fixture shape is identical in the page __NEXT_DATA__ (initialData) and in the
+// fetch_fixtures_by_date JSON API, so both code paths share this single mapper.
+function mapFixtureRow(r) {
     const dt = r.match && r.match.datetime ? new Date(r.match.datetime) : null;
     const date = (r.match && r.match.unformatted_date) || (dt && !isNaN(dt) ? dt.toISOString().substring(0, 10) : '');
     const time = dt && !isNaN(dt) ? dt.toISOString().substring(11, 16) : '';
@@ -305,7 +326,10 @@ function extractFromNextData(html) {
     const h = parseInt(p1x2.home, 10) || 0;
     const d = parseInt(p1x2.draw, 10) || 0;
     const a = parseInt(p1x2.away, 10) || 0;
-    const hasOdds = parseFloat(r.odds && r.odds.home) > 0;
+    // "Has odds" = real bookmaker odds OR a model prediction we can derive fair odds
+    // from. Since we now derive odds from the 1X2 %, every predicted match qualifies,
+    // so ONLY_WITH_ODDS stops hiding the bulk of the day's NS fixtures.
+    const hasOdds = (parseFloat(r.odds && r.odds.home) > 0) || (h + d + a > 0);
     const prediction = predFrom(h, d, a);
 
     const liveHome = r.score && r.score.home;
@@ -381,12 +405,12 @@ function extractFromNextData(html) {
       htProbHome: htProbs ? htProbs.home : null,
       htProbDraw: htProbs ? htProbs.draw : null,
       htProbAway: htProbs ? htProbs.away : null,
-      // Raw 1X2 odds — used by the Alerts tab bookmaker comparison.
-      oddsHome:  parseFloat(r.odds && r.odds.home) || null,
-      oddsDraw:  parseFloat(r.odds && r.odds.draw) || null,
-      oddsAway:  parseFloat(r.odds && r.odds.away) || null,
+      // 1X2 odds — real bookmaker odds when pitchpredictions has them, else fair
+      // odds derived from the model %. Used on every card + the Alerts comparison.
+      oddsHome:  oddsOrFair(r.odds && r.odds.home, h),
+      oddsDraw:  oddsOrFair(r.odds && r.odds.draw, d),
+      oddsAway:  oddsOrFair(r.odds && r.odds.away, a),
     };
-  });
 }
 
 // Try the structured JSON first; fall back to AI text-extraction only if needed.
@@ -455,20 +479,70 @@ function parseScore(score, idx) {
 }
 
 // ---- Sources & scheduling ----
-// Country pages on pitchpredictions return ~50 matches spanning ~5 days ahead.
-// Override via Railway env var: COUNTRY_FEEDS=argentina,brazil,sweden,norway,spain
-const COUNTRY_FEEDS = (process.env.COUNTRY_FEEDS || 'argentina,brazil,sweden,norway,spain')
+
+// pitchpredictions JSON API. fetch_fixtures_by_date returns the FULL slate for ONE
+// date (all countries, every status, with odds) — but it's capped at ~51 per call.
+// We pull a window of dates AND merge the per-country feeds (below) to beat the cap.
+const PP_API = process.env.PP_API_BASE || 'https://api.pitchpredictions.com/api';
+
+// Which dates to pull from the API, as day offsets from today (UTC). Each is a
+// separate ~51-fixture call. Default: yesterday → +3 days.
+const API_DATE_OFFSETS = (process.env.API_DATE_OFFSETS || '-1,0,1,2,3')
+  .split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+
+function isoDateOffset(days) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+function offsetLabel(off) {
+  if (off === 0) return 'today';
+  if (off === 1) return 'tomorrow';
+  if (off === -1) return 'yesterday';
+  return off > 0 ? `plus${off}d` : `minus${-off}d`;
+}
+
+// Call the JSON API for a whole date. Same fixture shape as the page data, so we
+// reuse mapFixtureRow. ~51 fixtures, all countries, with odds.
+async function fetchFixturesByDate(dateStr) {
+  const url = `${PP_API}/fetch_fixtures_by_date?fixture_date=${encodeURIComponent(dateStr)}`;
+  const { status: code, text } = await httpRequest('GET', url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept': 'application/json',
+      'Origin': 'https://www.pitchpredictions.com',
+      'Referer': 'https://www.pitchpredictions.com/',
+    },
+  });
+  if (code !== 200) throw new Error(`API HTTP ${code}: ${text.slice(0, 160)}`);
+  let json;
+  try { json = JSON.parse(text); } catch (e) { throw new Error('API returned non-JSON'); }
+  if (!json || !Array.isArray(json.data)) throw new Error('API: no data array');
+  return json.data.map(mapFixtureRow);
+}
+
+// Country pages add the matches the date-API cap drops (e.g. USA USL ~50/day).
+// Each returns ~50 fixtures spanning ~5 days. Expanded default covers the
+// high-volume countries; override via the COUNTRY_FEEDS env var.
+const COUNTRY_FEEDS = (process.env.COUNTRY_FEEDS ||
+  'argentina,brazil,chile,mexico,colombia,usa,sweden,norway,spain,england,italy,germany,france,china,japan,tanzania,syria,lebanon,mongolia,lithuania')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 function getSources() {
   const PP = 'https://www.pitchpredictions.com';
-  const list = [
-    { name: 'today',     url: FALLBACK_URL || PP,                     useBrowser: false, intervalMin: LIVE_REFRESH_MIN,   tier: 'live'   },
-    { name: 'tomorrow',  url: PP + '/football-predictions-tomorrow',  useBrowser: false, intervalMin: FUTURE_REFRESH_MIN, tier: 'future' },
-    { name: 'weekend',   url: PP + '/football-predictions-weekend',   useBrowser: false, intervalMin: FUTURE_REFRESH_MIN, tier: 'future' },
-    { name: 'yesterday', url: PP + '/football-predictions-yesterday', useBrowser: false, intervalMin: PAST_REFRESH_MIN,   tier: 'past'   },
-  ];
-  // Country feeds — give ~50 matches each across ~5 days, big boost to total coverage.
+  const list = [];
+  // Spine: one JSON-API call per date in the window (full slate + odds per day).
+  for (const off of API_DATE_OFFSETS) {
+    list.push({
+      name: `api-${offsetLabel(off)}`,
+      kind: 'api',
+      apiOffset: off,
+      useBrowser: false,
+      intervalMin: off === 0 ? LIVE_REFRESH_MIN : off > 0 ? FUTURE_REFRESH_MIN : PAST_REFRESH_MIN,
+      tier: off === 0 ? 'live' : off > 0 ? 'future' : 'past',
+    });
+  }
+  // Country feeds — fill the per-day gap above the API cap + harvest H2H URLs.
   for (const country of COUNTRY_FEEDS) {
     list.push({
       name: `country-${country}`,
@@ -596,42 +670,52 @@ async function scrapeOne(src, trigger = 'scheduler') {
   runningSources.add(src.name);
   const st = (sourceState[src.name] = sourceState[src.name] || {});
   st.lastRun = new Date().toISOString();
-  console.log(`[scrape ${src.name}] start (${trigger}) -> ${src.url}`);
+  console.log(`[scrape ${src.name}] start (${trigger}) -> ${src.url || ('API ' + isoDateOffset(src.apiOffset))}`);
   try {
-    // 1. Fetch HTML. Plain HTTPS first; only fall back to Browserless on Cloudflare.
-    let html;
-    if (src.useBrowser) {
-      html = await fetchPageHTML(src.url, src.useProxy);
+    // Build the match list. Two kinds of source:
+    //   kind 'api' → one JSON call for a whole date (full slate + odds, the heavy lifter)
+    //   otherwise  → scrape an HTML page's __NEXT_DATA__ (country feeds; also harvests
+    //                per-match detail URLs for on-demand H2H).
+    let list;
+    if (src.kind === 'api') {
+      const date = isoDateOffset(src.apiOffset);
+      list = await fetchFixturesByDate(date);
+      console.log(`[scrape ${src.name}] API ${date} → ${list.length} fixtures`);
     } else {
-      try {
-        html = await fetchPageDirect(src.url);
-        if (isCloudflareChallenge(html)) throw new Error('Cloudflare challenge in body');
-      } catch (e) {
-        const blocked = /cloudflare|just a moment|HTTP 403/i.test(e.message);
-        if (blocked && BROWSERLESS_TOKEN) {
-          console.log(`[scrape ${src.name}] plain HTTPS blocked, retrying via Browserless`);
-          html = await fetchPageHTML(src.url, false);
-        } else {
-          throw e;
+      // Fetch HTML. Plain HTTPS first; only fall back to Browserless on Cloudflare.
+      let html;
+      if (src.useBrowser) {
+        html = await fetchPageHTML(src.url, src.useProxy);
+      } else {
+        try {
+          html = await fetchPageDirect(src.url);
+          if (isCloudflareChallenge(html)) throw new Error('Cloudflare challenge in body');
+        } catch (e) {
+          const blocked = /cloudflare|just a moment|HTTP 403/i.test(e.message);
+          if (blocked && BROWSERLESS_TOKEN) {
+            console.log(`[scrape ${src.name}] plain HTTPS blocked, retrying via Browserless`);
+            html = await fetchPageHTML(src.url, false);
+          } else {
+            throw e;
+          }
         }
       }
-    }
-    if (isCloudflareChallenge(html)) {
-      throw new Error('blocked by Cloudflare (even via Browserless)');
-    }
+      if (isCloudflareChallenge(html)) {
+        throw new Error('blocked by Cloudflare (even via Browserless)');
+      }
 
-    // 2a. Harvest per-match URLs from the listing HTML.
-    //     The pattern is:  /match/football-predictions-<home>-vs-<away>-<fixtureId>/matches
-    //     We store these so /api/match/:id/details can fetch real H2H on demand later.
-    const urlRegex = /href="(\/match\/football-predictions-[^"]+?-(\d+)\/matches)"/g;
-    let _urlMatch;
-    while ((_urlMatch = urlRegex.exec(html)) !== null) {
-      matchUrls[_urlMatch[2]] = 'https://www.pitchpredictions.com' + _urlMatch[1];
-    }
+      // Harvest per-match URLs from the listing HTML so /api/match/:id/details can
+      // fetch real H2H on demand later.
+      //   pattern: /match/football-predictions-<home>-vs-<away>-<fixtureId>/matches
+      const urlRegex = /href="(\/match\/football-predictions-[^"]+?-(\d+)\/matches)"/g;
+      let _urlMatch;
+      while ((_urlMatch = urlRegex.exec(html)) !== null) {
+        matchUrls[_urlMatch[2]] = 'https://www.pitchpredictions.com' + _urlMatch[1];
+      }
 
-    // 2b. Extract & merge predictions.
-    const list = await extractPredictions(html);
-    console.log(`[scrape ${src.name}] ${html.length} bytes → ${list.length} matches`);
+      list = await extractPredictions(html);
+      console.log(`[scrape ${src.name}] ${html.length} bytes → ${list.length} matches`);
+    }
     if (!list.length) {
       st.lastError = '0 matches extracted';
       return { count: 0 };
@@ -1012,9 +1096,9 @@ function parseFormStats(text) {
 //
 // Pitchpredictions bakes the entire H2H / last-6 / standings dataset right into
 // the per-match page's __NEXT_DATA__ JSON. We fetch it lazily (only when a user
-// opens a detail modal) and cache it for 24 h to keep traffic low.
+// opens a detail modal) and cache it for 6 h to keep traffic low.
 //
-// Cost: 1 plain-HTTPS request per unique match-detail-open per 24 h. No
+// Cost: 1 plain-HTTPS request per unique match-detail-open per 6 h. No
 // Browserless tokens spent in the normal case.
 function slugifyForPP(name) {
   if (!name) return '';
@@ -1175,7 +1259,7 @@ app.get('/api/match/:id/details', originGate, async (req, res) => {
 
   // 2. Always call fetchPPMatchDetails when we have a fixture_id — even if H2H is
   //    filled locally — because STANDINGS data only comes from per-match pages.
-  //    The 24h cache prevents abuse.
+  //    The 6h cache prevents abuse.
   if (fixtureId) {
     try {
       const ext = await fetchPPMatchDetails(fixtureId, homeName, awayName);
