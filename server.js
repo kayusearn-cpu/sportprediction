@@ -1261,7 +1261,10 @@ function convertPpLast(m, teamName, teamId) {
 app.get('/api/match/:id/details', originGate, async (req, res) => {
   const id = decodeURIComponent(req.params.id || '');
   // Input validation — reject suspiciously long or weird IDs early.
-  if (!id || id.length > 200 || /[<>"'`{}]/.test(id)) {
+  // Only block angle brackets (the real XSS vector). Apostrophes/quotes/pipes are
+  // legitimate in match-key ids (e.g. "newell's old boys|...") and safe here — the
+  // id is just an object-key lookup returned as auto-escaped JSON, never HTML.
+  if (!id || id.length > 200 || /[<>]/.test(id)) {
     return res.status(400).json({ error: 'invalid id' });
   }
   const m = store.matches[id];
