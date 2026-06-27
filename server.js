@@ -858,19 +858,27 @@ async function pollTelegram() {
 // ---- Web API consumed by your website ----
 const app = express();
 
-// STRICT CORS — only listed origins. Browsers on other sites get blocked.
-//   - If ALLOWED_ORIGINS is empty, we allow all (good for dev / first deploy).
-//   - Once you set ALLOWED_ORIGINS in Railway env vars, ONLY those origins work.
-app.use(cors({
-  origin: (origin, callback) => {
-    if (ALLOWED_ORIGINS.length === 0) return callback(null, true);     // unrestricted before configuring
-    if (!origin) return callback(null, true);                          // non-browser callers (uptime monitor, etc.) handled by originGate below
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    console.warn(`[cors] blocked origin: ${origin}`);
-    return callback(new Error('Not allowed by CORS'));
-  },
-  credentials: false,
-}));
+// Host-suffix origin matching, so ALLOWED_ORIGINS only needs the BASE domains.
+//   'magicbettingtips.com' then allows the apex, www.magicbettingtips.com, AND
+//   Netlify deploy-preview subdomains (hash--site.netlify.app) — but NOT a
+//   look-alike like evil-magicbettingtips.com.
+function urlHost(u) { try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ''; } }
+function hostOk(host, allowed) {
+  if (!host || !allowed) return false;
+  return host === allowed || host.endsWith('.' + allowed) || host.endsWith('--' + allowed);
+}
+const ALLOWED_HOSTS = ALLOWED_ORIGINS.map(a =>
+  (a.includes('://') ? urlHost(a) : a.replace(/^https?:\/\//, '').replace(/\/.*$/, '').toLowerCase()));
+function originAllowed(value) {
+  const host = urlHost(value);
+  return !!host && ALLOWED_HOSTS.some(a => hostOk(host, a));
+}
+
+// CORS here is ONLY the response-header layer and must never throw — a thrown
+// error 500s the request and breaks in-app browsers (Telegram etc.) that send
+// "Origin: null". The real anti-leech enforcement is originGate() on the data
+// endpoints below, which 403s any origin/referer that isn't whitelisted.
+app.use(cors({ origin: true, credentials: false }));
 
 // Hard 10 KB cap on JSON body — we don't accept big payloads, so cut DOS vectors.
 app.use(express.json({ limit: '10kb' }));
@@ -895,12 +903,13 @@ app.use((req, res, next) => {
 //   3. Other domains spoofing CORS via residential proxies (Origin won't match) → 403
 // Public endpoints (/, /api/health, /scrape-now) skip this so UptimeRobot still works.
 function originGate(req, res, next) {
-  if (ALLOWED_ORIGINS.length === 0) return next();   // unrestricted in dev
-  const origin = req.headers.origin || '';
+  if (ALLOWED_ORIGINS.length === 0) return next();   // unrestricted until configured
+  const origin  = req.headers.origin || '';
   const referer = req.headers.referer || '';
-  const okOrigin  = origin  && ALLOWED_ORIGINS.includes(origin);
-  const okReferer = referer && ALLOWED_ORIGINS.some(o => referer.startsWith(o));
-  if (okOrigin || okReferer) return next();
+  // Allow if EITHER the Origin OR the Referer resolves to a whitelisted host.
+  // In-app browsers (e.g. Telegram) often send "Origin: null" but a real Referer,
+  // so the referer fallback keeps those real users working.
+  if (originAllowed(origin) || originAllowed(referer)) return next();
   console.warn(`[block] path=${req.path} origin=${origin || 'NONE'} referer=${referer || 'NONE'}`);
   return res.status(403).json({ error: 'forbidden — invalid origin' });
 }
