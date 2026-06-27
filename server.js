@@ -293,6 +293,17 @@ function oddsOrFair(raw, pct) {
   const fair = 100 / p;
   return Math.round(Math.min(Math.max(fair, 1.01), 51) * 100) / 100;
 }
+// Predicted correct score. The source has no scoreline field, so we derive a
+// plausible one that ALWAYS agrees with the 1X2 pick and reflects avg_goals
+// (low total → tight score, high total → more goals). Mirrors the boxed
+// predicted score pitchpredictions shows before kickoff.
+function predictedScoreline(pred, avgGoals) {
+  if (!pred) return '';
+  const g = parseFloat(avgGoals) || 2.5;
+  if (pred === '1') return g < 2 ? '1-0' : g < 3.2 ? '2-1' : '3-1';
+  if (pred === '2') return g < 2 ? '0-1' : g < 3.2 ? '1-2' : '1-3';
+  return g < 1.8 ? '0-0' : g < 3 ? '1-1' : '2-2';   // draw
+}
 // Infer real status from kickoff time so the front-end can bucket matches correctly.
 function effectiveStatus(date, time, srcStatus) {
   if (srcStatus === 'FT') return 'FT';
@@ -381,7 +392,7 @@ function mapFixtureRow(r) {
       country,
       countryFlag: (r.league && (r.league.flag || r.league.country_flag)) || '',
       prediction,
-      correctScore: '',
+      correctScore: predictedScoreline(prediction, r.predictions && r.predictions.avg_goals),
       probHome: h,
       probDraw: d,
       probAway: a,
@@ -524,8 +535,10 @@ async function fetchFixturesByDate(dateStr) {
 // Country pages add the matches the date-API cap drops (e.g. USA USL ~50/day).
 // Each returns ~50 fixtures spanning ~5 days. Expanded default covers the
 // high-volume countries; override via the COUNTRY_FEEDS env var.
+// "world" carries World Cup + international club friendlies (the "top matches"),
+// which the date API caps out — keep it near the front so it's always pulled.
 const COUNTRY_FEEDS = (process.env.COUNTRY_FEEDS ||
-  'argentina,brazil,chile,mexico,colombia,usa,sweden,norway,spain,england,italy,germany,france,china,japan,tanzania,syria,lebanon,mongolia,lithuania')
+  'world,argentina,brazil,chile,mexico,colombia,usa,sweden,norway,spain,england,italy,germany,france,china,japan,tanzania,syria,lebanon,mongolia,lithuania')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 function getSources() {
