@@ -75,6 +75,11 @@ const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '';
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+// OpenAI text-extraction fallback (for sources with no __NEXT_DATA__). OFF by
+// default: every source we use is JSON / __NEXT_DATA__-based, so a missing payload
+// just means an empty day — not a page that needs AI parsing. Leaving it on made
+// near-empty country pages (mexico/colombia) burn tokens extracting garbage.
+const ENABLE_OPENAI_FALLBACK = (process.env.ENABLE_OPENAI_FALLBACK || 'false').toLowerCase() === 'true';
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID || '';
@@ -431,7 +436,7 @@ async function extractPredictions(html) {
     console.log(`[extract] __NEXT_DATA__ -> ${fromJson.length} matches`);
     return fromJson;
   }
-  if (!OPENAI_KEY) return [];
+  if (!OPENAI_KEY || !ENABLE_OPENAI_FALLBACK) return [];
   console.log('[extract] no __NEXT_DATA__ matches; falling back to OpenAI');
   return extractWithOpenAI(html);
 }
