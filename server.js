@@ -298,16 +298,66 @@ function oddsOrFair(raw, pct) {
   const fair = 100 / p;
   return Math.round(Math.min(Math.max(fair, 1.01), 51) * 100) / 100;
 }
-// Predicted correct score. The source has no scoreline field, so we derive a
-// plausible one that ALWAYS agrees with the 1X2 pick and reflects avg_goals
-// (low total → tight score, high total → more goals). Mirrors the boxed
-// predicted score pitchpredictions shows before kickoff.
-function predictedScoreline(pred, avgGoals) {
-  if (!pred) return '';
-  const g = parseFloat(avgGoals) || 2.5;
-  if (pred === '1') return g < 2 ? '1-0' : g < 3.2 ? '2-1' : '3-1';
-  if (pred === '2') return g < 2 ? '0-1' : g < 3.2 ? '1-2' : '1-3';
-  return g < 1.8 ? '0-0' : g < 3 ? '1-1' : '2-2';   // draw
+// ---- Predicted scoreline via a Poisson expected-goals model ----
+// pitchpredictions exposes NO scoreline (only avg_goals, 1X2 %, and a form
+// sentence), so we estimate each team's expected goals (xG) from their real
+// goals-scored/conceded and pick the single most-likely scoreline that still
+// agrees with the 1X2 pick. Varied + data-driven, not fixed buckets.
+function poissonPmf(k, lambda) {
+  let p = Math.exp(-lambda);
+  for (let i = 1; i <= k; i++) p *= lambda / i;
+  return p;
+}
+function mostLikelyScore(homeXg, awayXg, result) {
+  let best = '', bestP = -1;
+  for (let i = 0; i <= 6; i++) {
+    const pi = poissonPmf(i, homeXg);
+    for (let j = 0; j <= 6; j++) {
+      if (result === '1' && !(i > j)) continue;   // keep the score consistent
+      if (result === '2' && !(i < j)) continue;   // with the predicted 1X2 result
+      if (result === 'X' && i !== j) continue;
+      const p = pi * poissonPmf(j, awayXg);
+      if (p > bestP) { bestP = p; best = `${i}-${j}`; }
+    }
+  }
+  if (best) return best;
+  // No result constraint matched → global most-likely score.
+  for (let i = 0; i <= 6; i++) { const pi = poissonPmf(i, homeXg);
+    for (let j = 0; j <= 6; j++) { const p = pi * poissonPmf(j, awayXg); if (p > bestP) { bestP = p; best = `${i}-${j}`; } } }
+  return best || '1-0';
+}
+// Pull "<scored> goals scored and <conceded> conceded across <N> matches" for
+// each side out of the recommendation sentence → per-game attack/defence rates.
+function teamGoals(text, side) {
+  if (!text) return null;
+  const re = side === 'home'
+    ? /home side[^0-9]*(\d+)\s*goals\s*scored[^0-9]*(\d+)\s*conceded[^0-9]*(\d+)\s*match/i
+    : /away side[^0-9]*(\d+)\s*goals[^0-9]*conceded\s*(\d+)[^0-9]*(\d+)\s*match/i;
+  const m = text.match(re);
+  if (!m || !+m[3]) return null;
+  return { att: +m[1] / +m[3], def: +m[2] / +m[3] };
+}
+function predictScore(preds, h, d, a, result) {
+  if (!preds) return '';
+  const total = parseFloat(preds.avg_goals) || 2.5;
+  const hf = teamGoals(preds.recommendation, 'home');
+  const af = teamGoals(preds.recommendation, 'away');
+  let homeXg, awayXg;
+  if (hf && af) {
+    homeXg = ((hf.att + af.def) / 2) * 1.10;   // attack vs opp defence + home edge
+    awayXg = ((af.att + hf.def) / 2) * 0.95;
+  } else {
+    const hs = (h || 33) + (d || 34) / 2;       // fall back to the 1X2 lean
+    const as = (a || 33) + (d || 34) / 2;
+    const denom = hs + as || 1;
+    homeXg = total * (hs / denom);
+    awayXg = total * (as / denom);
+  }
+  const sum = homeXg + awayXg;                   // rescale so xG sums to avg_goals
+  if (sum > 0) { homeXg = homeXg / sum * total; awayXg = awayXg / sum * total; }
+  homeXg = Math.max(0.15, Math.min(4.5, homeXg));
+  awayXg = Math.max(0.15, Math.min(4.5, awayXg));
+  return mostLikelyScore(homeXg, awayXg, result);
 }
 // Infer real status from kickoff time so the front-end can bucket matches correctly.
 function effectiveStatus(date, time, srcStatus) {
@@ -397,7 +447,7 @@ function mapFixtureRow(r) {
       country,
       countryFlag: (r.league && (r.league.flag || r.league.country_flag)) || '',
       prediction,
-      correctScore: predictedScoreline(prediction, r.predictions && r.predictions.avg_goals),
+      correctScore: predictScore(r.predictions, h, d, a, prediction),
       probHome: h,
       probDraw: d,
       probAway: a,
