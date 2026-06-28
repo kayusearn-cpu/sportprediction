@@ -342,17 +342,11 @@ function predictScore(preds, h, d, a, result) {
   const total = parseFloat(preds.avg_goals) || 2.5;
   const hf = teamGoals(preds.recommendation, 'home');
   const af = teamGoals(preds.recommendation, 'away');
-  let homeXg, awayXg;
-  if (hf && af) {
-    homeXg = ((hf.att + af.def) / 2) * 1.10;   // attack vs opp defence + home edge
-    awayXg = ((af.att + hf.def) / 2) * 0.95;
-  } else {
-    const hs = (h || 33) + (d || 34) / 2;       // fall back to the 1X2 lean
-    const as = (a || 33) + (d || 34) / 2;
-    const denom = hs + as || 1;
-    homeXg = total * (hs / denom);
-    awayXg = total * (as / denom);
-  }
+  // Only produce a score when we have BOTH teams' real goal data — otherwise we'd
+  // just be guessing, so leave it blank and the card shows no predicted score.
+  if (!hf || !af) return '';
+  let homeXg = ((hf.att + af.def) / 2) * 1.10;   // attack vs opp defence + home edge
+  let awayXg = ((af.att + hf.def) / 2) * 0.95;
   const sum = homeXg + awayXg;                   // rescale so xG sums to avg_goals
   if (sum > 0) { homeXg = homeXg / sum * total; awayXg = awayXg / sum * total; }
   homeXg = Math.max(0.15, Math.min(4.5, homeXg));
