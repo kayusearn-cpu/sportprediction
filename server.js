@@ -298,61 +298,9 @@ function oddsOrFair(raw, pct) {
   const fair = 100 / p;
   return Math.round(Math.min(Math.max(fair, 1.01), 51) * 100) / 100;
 }
-// ---- Predicted scoreline via a Poisson expected-goals model ----
-// pitchpredictions exposes NO scoreline (only avg_goals, 1X2 %, and a form
-// sentence), so we estimate each team's expected goals (xG) from their real
-// goals-scored/conceded and pick the single most-likely scoreline that still
-// agrees with the 1X2 pick. Varied + data-driven, not fixed buckets.
-function poissonPmf(k, lambda) {
-  let p = Math.exp(-lambda);
-  for (let i = 1; i <= k; i++) p *= lambda / i;
-  return p;
-}
-function mostLikelyScore(homeXg, awayXg, result) {
-  let best = '', bestP = -1;
-  for (let i = 0; i <= 6; i++) {
-    const pi = poissonPmf(i, homeXg);
-    for (let j = 0; j <= 6; j++) {
-      if (result === '1' && !(i > j)) continue;   // keep the score consistent
-      if (result === '2' && !(i < j)) continue;   // with the predicted 1X2 result
-      if (result === 'X' && i !== j) continue;
-      const p = pi * poissonPmf(j, awayXg);
-      if (p > bestP) { bestP = p; best = `${i}-${j}`; }
-    }
-  }
-  if (best) return best;
-  // No result constraint matched → global most-likely score.
-  for (let i = 0; i <= 6; i++) { const pi = poissonPmf(i, homeXg);
-    for (let j = 0; j <= 6; j++) { const p = pi * poissonPmf(j, awayXg); if (p > bestP) { bestP = p; best = `${i}-${j}`; } } }
-  return best || '1-0';
-}
-// Pull "<scored> goals scored and <conceded> conceded across <N> matches" for
-// each side out of the recommendation sentence → per-game attack/defence rates.
-function teamGoals(text, side) {
-  if (!text) return null;
-  const re = side === 'home'
-    ? /home side[^0-9]*(\d+)\s*goals\s*scored[^0-9]*(\d+)\s*conceded[^0-9]*(\d+)\s*match/i
-    : /away side[^0-9]*(\d+)\s*goals[^0-9]*conceded\s*(\d+)[^0-9]*(\d+)\s*match/i;
-  const m = text.match(re);
-  if (!m || !+m[3]) return null;
-  return { att: +m[1] / +m[3], def: +m[2] / +m[3] };
-}
-function predictScore(preds, h, d, a, result) {
-  if (!preds) return '';
-  const total = parseFloat(preds.avg_goals) || 2.5;
-  const hf = teamGoals(preds.recommendation, 'home');
-  const af = teamGoals(preds.recommendation, 'away');
-  // Only produce a score when we have BOTH teams' real goal data — otherwise we'd
-  // just be guessing, so leave it blank and the card shows no predicted score.
-  if (!hf || !af) return '';
-  let homeXg = ((hf.att + af.def) / 2) * 1.10;   // attack vs opp defence + home edge
-  let awayXg = ((af.att + hf.def) / 2) * 0.95;
-  const sum = homeXg + awayXg;                   // rescale so xG sums to avg_goals
-  if (sum > 0) { homeXg = homeXg / sum * total; awayXg = awayXg / sum * total; }
-  homeXg = Math.max(0.15, Math.min(4.5, homeXg));
-  awayXg = Math.max(0.15, Math.min(4.5, awayXg));
-  return mostLikelyScore(homeXg, awayXg, result);
-}
+// No computed/predicted scoreline. pitchpredictions exposes no scoreline of its
+// own, so we never guess one — the UI shows only the REAL scraped result
+// (full-time, half-time in parentheses) and "-" for matches not yet played.
 // Infer real status from kickoff time so the front-end can bucket matches correctly.
 function effectiveStatus(date, time, srcStatus) {
   if (srcStatus === 'FT') return 'FT';
@@ -441,7 +389,7 @@ function mapFixtureRow(r) {
       country,
       countryFlag: (r.league && (r.league.flag || r.league.country_flag)) || '',
       prediction,
-      correctScore: predictScore(r.predictions, h, d, a, prediction),
+      correctScore: '',   // no guessed score — the UI shows only the real scraped result
       probHome: h,
       probDraw: d,
       probAway: a,
