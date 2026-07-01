@@ -298,9 +298,56 @@ function oddsOrFair(raw, pct) {
   const fair = 100 / p;
   return Math.round(Math.min(Math.max(fair, 1.01), 51) * 100) / 100;
 }
-// No computed/predicted scoreline. pitchpredictions exposes no scoreline of its
-// own, so we never guess one — the UI shows only the REAL scraped result
-// (full-time, half-time in parentheses) and "-" for matches not yet played.
+// ---- Predicted scoreline via a Poisson expected-goals model ----
+// pitchpredictions exposes no scoreline, so we estimate each team's expected
+// goals (xG) from their REAL goals-scored/conceded (in the recommendation form
+// sentence) and pick the single most-likely scoreline consistent with the 1X2
+// pick. If we don't have both teams' goal data we return '' (never a guess).
+function poissonPmf(k, lambda) {
+  let p = Math.exp(-lambda);
+  for (let i = 1; i <= k; i++) p *= lambda / i;
+  return p;
+}
+function mostLikelyScore(homeXg, awayXg, result) {
+  let best = '', bestP = -1;
+  for (let i = 0; i <= 6; i++) {
+    const pi = poissonPmf(i, homeXg);
+    for (let j = 0; j <= 6; j++) {
+      if (result === '1' && !(i > j)) continue;
+      if (result === '2' && !(i < j)) continue;
+      if (result === 'X' && i !== j) continue;
+      const p = pi * poissonPmf(j, awayXg);
+      if (p > bestP) { bestP = p; best = `${i}-${j}`; }
+    }
+  }
+  if (best) return best;
+  for (let i = 0; i <= 6; i++) { const pi = poissonPmf(i, homeXg);
+    for (let j = 0; j <= 6; j++) { const p = pi * poissonPmf(j, awayXg); if (p > bestP) { bestP = p; best = `${i}-${j}`; } } }
+  return best || '1-0';
+}
+function teamGoals(text, side) {
+  if (!text) return null;
+  const re = side === 'home'
+    ? /home side[^0-9]*(\d+)\s*goals\s*scored[^0-9]*(\d+)\s*conceded[^0-9]*(\d+)\s*match/i
+    : /away side[^0-9]*(\d+)\s*goals[^0-9]*conceded\s*(\d+)[^0-9]*(\d+)\s*match/i;
+  const m = text.match(re);
+  if (!m || !+m[3]) return null;
+  return { att: +m[1] / +m[3], def: +m[2] / +m[3] };
+}
+function predictScore(preds, h, d, a, result) {
+  if (!preds) return '';
+  const total = parseFloat(preds.avg_goals) || 2.5;
+  const hf = teamGoals(preds.recommendation, 'home');
+  const af = teamGoals(preds.recommendation, 'away');
+  if (!hf || !af) return '';   // no real goal data → no guess
+  let homeXg = ((hf.att + af.def) / 2) * 1.10;
+  let awayXg = ((af.att + hf.def) / 2) * 0.95;
+  const sum = homeXg + awayXg;
+  if (sum > 0) { homeXg = homeXg / sum * total; awayXg = awayXg / sum * total; }
+  homeXg = Math.max(0.15, Math.min(4.5, homeXg));
+  awayXg = Math.max(0.15, Math.min(4.5, awayXg));
+  return mostLikelyScore(homeXg, awayXg, result);
+}
 // Infer real status from kickoff time so the front-end can bucket matches correctly.
 function effectiveStatus(date, time, srcStatus) {
   if (srcStatus === 'FT') return 'FT';
@@ -389,7 +436,7 @@ function mapFixtureRow(r) {
       country,
       countryFlag: (r.league && (r.league.flag || r.league.country_flag)) || '',
       prediction,
-      correctScore: '',   // no guessed score — the UI shows only the real scraped result
+      correctScore: predictScore(r.predictions, h, d, a, prediction),
       probHome: h,
       probDraw: d,
       probAway: a,
@@ -529,6 +576,27 @@ async function fetchFixturesByDate(dateStr) {
   return json.data.map(mapFixtureRow);
 }
 
+// A specific competition by pitchpredictions league_id (fetch_league_fixtures).
+// Used for the World Cup, whose fixtures the date API drops and the crowded
+// "world" feed pushes past its 51-item cap. Returns the league's full fixture
+// list (same shape → mapFixtureRow).
+async function fetchLeagueFixtures(leagueId) {
+  const url = `${PP_API}/fetch_league_fixtures?league_id=${encodeURIComponent(leagueId)}`;
+  const { status: code, text } = await httpRequest('GET', url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept': 'application/json',
+      'Origin': 'https://www.pitchpredictions.com',
+      'Referer': 'https://www.pitchpredictions.com/',
+    },
+  });
+  if (code !== 200) throw new Error(`League API HTTP ${code}: ${text.slice(0, 160)}`);
+  let json;
+  try { json = JSON.parse(text); } catch (e) { throw new Error('League API returned non-JSON'); }
+  if (!json || !Array.isArray(json.data)) throw new Error('League API: no data array');
+  return json.data.map(mapFixtureRow);
+}
+
 // Country pages add the matches the date-API cap drops (e.g. USA USL ~50/day).
 // Each returns ~50 fixtures spanning ~5 days. Expanded default covers the
 // high-volume countries; override via the COUNTRY_FEEDS env var.
@@ -537,6 +605,14 @@ async function fetchFixturesByDate(dateStr) {
 const COUNTRY_FEEDS = (process.env.COUNTRY_FEEDS ||
   'world,argentina,brazil,chile,mexico,colombia,usa,sweden,norway,spain,england,italy,germany,france,china,japan,tanzania,syria,lebanon,mongolia,lithuania')
   .split(',').map(s => s.trim()).filter(Boolean);
+
+// Specific competitions pulled by league_id (fetch_league_fixtures) — the date
+// API and world feed miss these marquee events. Default: 1 = FIFA World Cup.
+// Format: "id:label,id:label" (label is just for the source name / logs).
+const TOP_LEAGUES = (process.env.TOP_LEAGUES || '1:world-cup')
+  .split(',').map(s => s.trim()).filter(Boolean)
+  .map(pair => { const [id, label] = pair.split(':'); return { id: (id || '').trim(), label: (label || id || '').trim() }; })
+  .filter(l => l.id);
 
 function getSources() {
   const PP = 'https://www.pitchpredictions.com';
@@ -560,6 +636,18 @@ function getSources() {
       useBrowser: false,
       intervalMin: FUTURE_REFRESH_MIN,
       tier: 'future',
+    });
+  }
+  // Marquee competitions by league_id (World Cup) on a live cadence so scores
+  // update fast — these are dropped by the date API and the crowded world feed.
+  for (const lg of TOP_LEAGUES) {
+    list.push({
+      name: `league-${lg.label}`,
+      kind: 'league',
+      leagueId: lg.id,
+      useBrowser: false,
+      intervalMin: LIVE_REFRESH_MIN,
+      tier: 'live',
     });
   }
   if (ENABLE_PRIMARY && TARGET_URL) {
@@ -691,6 +779,9 @@ async function scrapeOne(src, trigger = 'scheduler') {
       const date = isoDateOffset(src.apiOffset);
       list = await fetchFixturesByDate(date);
       console.log(`[scrape ${src.name}] API ${date} → ${list.length} fixtures`);
+    } else if (src.kind === 'league') {
+      list = await fetchLeagueFixtures(src.leagueId);
+      console.log(`[scrape ${src.name}] league ${src.leagueId} → ${list.length} fixtures`);
     } else {
       // Fetch HTML. Plain HTTPS first; only fall back to Browserless on Cloudflare.
       let html;
