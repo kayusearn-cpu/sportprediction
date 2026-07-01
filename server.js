@@ -768,7 +768,9 @@ async function scrapeOne(src, trigger = 'scheduler') {
   runningSources.add(src.name);
   const st = (sourceState[src.name] = sourceState[src.name] || {});
   st.lastRun = new Date().toISOString();
-  console.log(`[scrape ${src.name}] start (${trigger}) -> ${src.url || ('API ' + isoDateOffset(src.apiOffset))}`);
+  const _startTarget = src.url
+    || (src.kind === 'league' ? `league ${src.leagueId}` : `API ${isoDateOffset(src.apiOffset)}`);
+  console.log(`[scrape ${src.name}] start (${trigger}) -> ${_startTarget}`);
   try {
     // Build the match list. Two kinds of source:
     //   kind 'api' → one JSON call for a whole date (full slate + odds, the heavy lifter)
