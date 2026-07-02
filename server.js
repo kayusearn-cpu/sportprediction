@@ -344,9 +344,16 @@ function predictScore(preds, h, d, a, result) {
   let awayXg = ((af.att + hf.def) / 2) * 0.95;
   const sum = homeXg + awayXg;
   if (sum > 0) { homeXg = homeXg / sum * total; awayXg = awayXg / sum * total; }
-  homeXg = Math.max(0.15, Math.min(4.5, homeXg));
-  awayXg = Math.max(0.15, Math.min(4.5, awayXg));
-  return mostLikelyScore(homeXg, awayXg, result);
+  homeXg = Math.max(0.15, Math.min(5, homeXg));
+  awayXg = Math.max(0.15, Math.min(5, awayXg));
+  // Rounded expected goals → a realistic scoreline that reflects avg_goals
+  // (the Poisson "single most likely" score collapsed everything to 1-0/0-1).
+  // Keep it consistent with the 1X2 pick by trimming the non-favoured side.
+  let hg = Math.round(homeXg), ag = Math.round(awayXg);
+  if (result === '1' && hg <= ag) ag = Math.max(0, hg - 1);
+  else if (result === '2' && ag <= hg) hg = Math.max(0, ag - 1);
+  else if (result === 'X') { hg = ag = Math.round((homeXg + awayXg) / 2); }
+  return `${hg}-${ag}`;
 }
 // Infer real status from kickoff time so the front-end can bucket matches correctly.
 function effectiveStatus(date, time, srcStatus) {
