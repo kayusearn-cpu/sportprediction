@@ -64,6 +64,9 @@ const LEGACY_REFRESH = parseInt(process.env.REFRESH_MINUTES || '5', 10);
 const LIVE_REFRESH_MIN = parseInt(process.env.LIVE_REFRESH_MIN || String(LEGACY_REFRESH), 10);
 const FUTURE_REFRESH_MIN = parseInt(process.env.FUTURE_REFRESH_MIN || '60', 10);
 const PAST_REFRESH_MIN = parseInt(process.env.PAST_REFRESH_MIN || '360', 10);
+// The dedicated live-games feed is tiny (~12 rows) and cheap, so poll it fast so
+// in-play scores/minutes actually move. Default 3 min (override LIVE_GAMES_MIN).
+const LIVE_GAMES_MIN = parseInt(process.env.LIVE_GAMES_MIN || '3', 10);
 
 const TARGET_URL = process.env.TARGET_URL || 'https://www.forebet.com/en/football-tips-and-predictions-for-today';
 const FALLBACK_URL = process.env.FALLBACK_URL || 'https://www.pitchpredictions.com';
@@ -303,27 +306,67 @@ function oddsOrFair(raw, pct) {
 // goals (xG) from their REAL goals-scored/conceded (in the recommendation form
 // sentence) and pick the single most-likely scoreline consistent with the 1X2
 // pick. If we don't have both teams' goal data we return '' (never a guess).
-function poissonPmf(k, lambda) {
-  let p = Math.exp(-lambda);
-  for (let i = 1; i <= k; i++) p *= lambda / i;
-  return p;
+// The single "top pick" pitchpredictions surfaces on a card: the highest-
+// confidence call across 1X2 / Over-Under 2.5 / Double Chance. MUST mirror
+// topPick() in index.html EXACTLY (same inputs, same tie order, same parseInt)
+// so the badge the user sees and the scoreline we build from it never disagree.
+function computeTopPick(h, d, a, ouPred, ouPct, dcType, dcPct) {
+  const best = Math.max(h, d, a);
+  const cands = [];
+  if (best > 0) cands.push({ label: best === h ? '1' : best === a ? '2' : 'X', pct: best, kind: '1x2' });
+  if (ouPred && ouPct) cands.push({ label: ouPred, pct: parseInt(ouPct, 10) || 0, kind: 'ou', raw: ouPred });
+  if (dcType && dcPct) cands.push({ label: dcType, pct: parseInt(dcPct, 10) || 0, kind: 'dc' });
+  if (!cands.length) return null;
+  cands.sort((x, y) => y.pct - x.pct);   // stable sort → ties resolve 1x2 > ou > dc
+  return cands[0];
 }
-function mostLikelyScore(homeXg, awayXg, result) {
-  let best = '', bestP = -1;
-  for (let i = 0; i <= 6; i++) {
-    const pi = poissonPmf(i, homeXg);
-    for (let j = 0; j <= 6; j++) {
-      if (result === '1' && !(i > j)) continue;
-      if (result === '2' && !(i < j)) continue;
-      if (result === 'X' && i !== j) continue;
-      const p = pi * poissonPmf(j, awayXg);
-      if (p > bestP) { bestP = p; best = `${i}-${j}`; }
-    }
+// Build a scoreline that AGREES with the displayed top pick AND the xG lean, so
+// the number never contradicts the badge above it:
+//   • pick = Away/Home Win  → that side leads
+//   • pick = Over 2.5       → total ≥ 3 (winner kept ahead)
+//   • pick = Under 2.5      → total ≤ 2
+//   • pick = Double Chance  → scoreline stays inside the allowed 1X / 12 / X2 set
+function scorelineFor(homeXg, awayXg, result, pick) {
+  // 1) Who should the scoreline show winning?  Default = most-likely 1X2 (result).
+  let want = result;                                   // '1' | 'X' | '2'
+  if (pick && pick.kind === '1x2') want = pick.label;
+  else if (pick && pick.kind === 'dc') {
+    const lean = homeXg > awayXg ? '1' : awayXg > homeXg ? '2' : 'X';
+    if (pick.label === '1X')      want = lean === '2' ? (homeXg >= awayXg ? '1' : 'X') : lean;
+    else if (pick.label === '12') want = lean === 'X' ? (homeXg >= awayXg ? '1' : '2') : lean;
+    else /* X2 */                 want = lean === '1' ? (awayXg >= homeXg ? '2' : 'X') : lean;
   }
-  if (best) return best;
-  for (let i = 0; i <= 6; i++) { const pi = poissonPmf(i, homeXg);
-    for (let j = 0; j <= 6; j++) { const p = pi * poissonPmf(j, awayXg); if (p > bestP) { bestP = p; best = `${i}-${j}`; } } }
-  return best || '1-0';
+  const over = pick && pick.kind === 'ou' ? (pick.raw === 'Ov2.5' ? 1 : -1) : 0;
+
+  // 2) Draw is its own case — keep both sides equal, honour the O/U band.
+  if (want === 'X') {
+    let g = Math.round((homeXg + awayXg) / 2);
+    if (over === 1 && 2 * g < 3) g = 2;     // 2-2 → over 2.5
+    if (over === -1 && 2 * g > 2) g = 1;    // 1-1 → under 2.5
+    g = Math.min(4, Math.max(0, g));
+    return `${g}-${g}`;
+  }
+
+  // 3) Decisive — round xG, then force the favoured side to actually lead.
+  let hg = Math.max(0, Math.round(homeXg));
+  let ag = Math.max(0, Math.round(awayXg));
+  if (want === '1' && hg <= ag) hg = ag + 1;
+  if (want === '2' && ag <= hg) ag = hg + 1;
+
+  // 4) Enforce Over/Under 2.5 while keeping the winner ahead (bounded loop).
+  let guard = 0;
+  if (over === 1) {
+    while (hg + ag < 3 && guard++ < 20) { if (want === '1') hg++; else ag++; }
+  } else if (over === -1) {
+    while (hg + ag > 2 && guard++ < 20) {
+      if (want === '1') { if (ag > 0) ag--; else hg = Math.max(2, hg - 1); }
+      else              { if (hg > 0) hg--; else ag = Math.max(2, ag - 1); }
+    }
+    if (want === '1' && hg <= ag) hg = ag + 1;   // re-assert lead after trimming
+    if (want === '2' && ag <= hg) ag = hg + 1;
+  }
+
+  return `${Math.min(7, hg)}-${Math.min(7, ag)}`;
 }
 function teamGoals(text, side) {
   if (!text) return null;
@@ -334,7 +377,7 @@ function teamGoals(text, side) {
   if (!m || !+m[3]) return null;
   return { att: +m[1] / +m[3], def: +m[2] / +m[3] };
 }
-function predictScore(preds, h, d, a, result) {
+function predictScore(preds, h, d, a, result, pick) {
   if (!preds) return '';
   const total = parseFloat(preds.avg_goals) || 2.5;
   const hf = teamGoals(preds.recommendation, 'home');
@@ -346,14 +389,9 @@ function predictScore(preds, h, d, a, result) {
   if (sum > 0) { homeXg = homeXg / sum * total; awayXg = awayXg / sum * total; }
   homeXg = Math.max(0.15, Math.min(5, homeXg));
   awayXg = Math.max(0.15, Math.min(5, awayXg));
-  // Rounded expected goals → a realistic scoreline that reflects avg_goals
-  // (the Poisson "single most likely" score collapsed everything to 1-0/0-1).
-  // Keep it consistent with the 1X2 pick by trimming the non-favoured side.
-  let hg = Math.round(homeXg), ag = Math.round(awayXg);
-  if (result === '1' && hg <= ag) ag = Math.max(0, hg - 1);
-  else if (result === '2' && ag <= hg) hg = Math.max(0, ag - 1);
-  else if (result === 'X') { hg = ag = Math.round((homeXg + awayXg) / 2); }
-  return `${hg}-${ag}`;
+  // Rounded expected goals, then reconciled with the visible top pick so the
+  // scoreline, the Over/Under call and the winner all tell the same story.
+  return scorelineFor(homeXg, awayXg, result, pick);
 }
 // Infer real status from kickoff time so the front-end can bucket matches correctly.
 function effectiveStatus(date, time, srcStatus) {
@@ -415,6 +453,8 @@ function mapFixtureRow(r) {
     const btts = r.predictions && r.predictions.both_teams_to_score;
     const dc = r.predictions && r.predictions.double_chance;
     const htProbs = r.predictions && r.predictions.half_time;
+    // The one badge the card shows — build the scoreline to agree with it.
+    const pick = computeTopPick(h, d, a, ouPred, ouProb, dc ? dc.type : '', dc ? dc.probability : null);
 
     // Country lives on the league object on pitchpredictions. The exact key
     // varies a bit across endpoints — check them all and fall back to top-level
@@ -443,7 +483,7 @@ function mapFixtureRow(r) {
       country,
       countryFlag: (r.league && (r.league.flag || r.league.country_flag)) || '',
       prediction,
-      correctScore: predictScore(r.predictions, h, d, a, prediction),
+      correctScore: predictScore(r.predictions, h, d, a, prediction, pick),
       probHome: h,
       probDraw: d,
       probAway: a,
@@ -604,6 +644,28 @@ async function fetchLeagueFixtures(leagueId) {
   return json.data.map(mapFixtureRow);
 }
 
+// EVERY currently in-play match, across all countries, with live score + minute
+// (fetch_live_games). The date-API spine is capped at ~51/day and the country
+// feeds only refresh hourly, so most live games — international ones especially —
+// never got a fresh score. This is the source that actually makes "live" live.
+// Same fixture shape (predictions included) → mapFixtureRow.
+async function fetchLiveGames() {
+  const url = `${PP_API}/fetch_live_games`;
+  const { status: code, text } = await httpRequest('GET', url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept': 'application/json',
+      'Origin': 'https://www.pitchpredictions.com',
+      'Referer': 'https://www.pitchpredictions.com/',
+    },
+  });
+  if (code !== 200) throw new Error(`Live API HTTP ${code}: ${text.slice(0, 160)}`);
+  let json;
+  try { json = JSON.parse(text); } catch (e) { throw new Error('Live API returned non-JSON'); }
+  if (!json || !Array.isArray(json.data)) throw new Error('Live API: no data array');
+  return json.data.map(mapFixtureRow);
+}
+
 // Country pages add the matches the date-API cap drops (e.g. USA USL ~50/day).
 // Each returns ~50 fixtures spanning ~5 days. Expanded default covers the
 // high-volume countries; override via the COUNTRY_FEEDS env var.
@@ -657,6 +719,8 @@ function getSources() {
       tier: 'live',
     });
   }
+  // Every in-play match, refreshed fast, so live scores/minutes are never stale.
+  list.push({ name: 'live-games', kind: 'live', useBrowser: false, intervalMin: LIVE_GAMES_MIN, tier: 'live' });
   if (ENABLE_PRIMARY && TARGET_URL) {
     list.push({ name: 'primary', url: TARGET_URL, useBrowser: true, useProxy: true, intervalMin: PAST_REFRESH_MIN, tier: 'primary' });
   }
@@ -674,9 +738,12 @@ function mergeIntoCache(list) {
     p.status = effectiveStatus(p.date, p.time, p.status);
     if (ONLY_WITH_ODDS && !p.hasOdds && p.status === 'NS') continue;
     const k = matchKey(p.homeTeam, p.awayTeam);
-    const h = clampPct(p.probHome);
-    const d = clampPct(p.probDraw);
-    const a = clampPct(p.probAway);
+    // Fall back to the previous prediction if this row arrives without one (e.g. a
+    // status-only refresh) so a live update never blanks the numbers on the card.
+    const prevP = store.preds[k] || {};
+    const h = clampPct(p.probHome) || prevP.h || 0;
+    const d = clampPct(p.probDraw) || prevP.d || 0;
+    const a = clampPct(p.probAway) || prevP.a || 0;
     // Preserve existing record so a partial re-scrape (e.g. status-only) keeps detail fields.
     const prev = store.matches[k] || {};
     newMatches[k] = {
@@ -700,9 +767,9 @@ function mergeIntoCache(list) {
       country: p.country || prev.country || '',
       countryFlag: p.countryFlag || prev.countryFlag || '',
       status: p.status,
-      prediction: p.prediction || '',
-      correctScore: p.correctScore || '',
-      advice: p.advice || '',
+      prediction: p.prediction || prev.prediction || '',
+      correctScore: p.correctScore || prev.correctScore || '',
+      advice: p.advice || prev.advice || '',
       // NEW: live timer + detail-modal data
       fixtureId: p.fixtureId != null ? p.fixtureId : prev.fixtureId || null,
       statusRaw: p.statusRaw || prev.statusRaw || '',
@@ -728,7 +795,7 @@ function mergeIntoCache(list) {
     };
     newPreds[k] = {
       h, d, a,
-      score: p.correctScore || '',
+      score: p.correctScore || prevP.score || '',
       advice: p.advice || (p.prediction === '1' ? 'Home Win' : p.prediction === '2' ? 'Away Win' : p.prediction === 'X' ? 'Draw' : ''),
       confidence: Math.round(Math.max(h, d, a) / 10) / 10,
       sources: ['scraped'],
@@ -776,7 +843,9 @@ async function scrapeOne(src, trigger = 'scheduler') {
   const st = (sourceState[src.name] = sourceState[src.name] || {});
   st.lastRun = new Date().toISOString();
   const _startTarget = src.url
-    || (src.kind === 'league' ? `league ${src.leagueId}` : `API ${isoDateOffset(src.apiOffset)}`);
+    || (src.kind === 'league' ? `league ${src.leagueId}`
+      : src.kind === 'live' ? 'live-games'
+      : `API ${isoDateOffset(src.apiOffset)}`);
   console.log(`[scrape ${src.name}] start (${trigger}) -> ${_startTarget}`);
   try {
     // Build the match list. Two kinds of source:
@@ -791,6 +860,9 @@ async function scrapeOne(src, trigger = 'scheduler') {
     } else if (src.kind === 'league') {
       list = await fetchLeagueFixtures(src.leagueId);
       console.log(`[scrape ${src.name}] league ${src.leagueId} → ${list.length} fixtures`);
+    } else if (src.kind === 'live') {
+      list = await fetchLiveGames();
+      console.log(`[scrape ${src.name}] live → ${list.length} in-play`);
     } else {
       // Fetch HTML. Plain HTTPS first; only fall back to Browserless on Cloudflare.
       let html;
