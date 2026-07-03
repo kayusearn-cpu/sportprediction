@@ -456,6 +456,34 @@ function mapFixtureRow(r) {
     // The one badge the card shows — build the scoreline to agree with it.
     const pick = computeTopPick(h, d, a, ouPred, ouProb, dc ? dc.type : '', dc ? dc.probability : null);
 
+    // === Correct score is the MASTER prediction ===
+    // The scoreline is already built to honour the highest-confidence pick; now
+    // derive EVERY other market (1X2 outcome, Over/Under 2.5, BTTS) straight from
+    // that score so the card can never show a contradiction like "2-1 · Under 2.5".
+    // When we have no real goal data the score is '' → we keep pitch's own markets.
+    const correctScore = predictScore(r.predictions, h, d, a, prediction, pick);
+    let outcomeFinal = prediction, winTextFinal = winText;
+    let ouPredFinal = ouPred || '', ouProbFinal = ouProb || null, ouLabelFinal = ou;
+    let bttsPredFinal = btts ? btts.prediction : '', bttsProbFinal = btts ? btts.probability : null;
+    const _cs = String(correctScore).split('-');
+    const _ch = parseInt(_cs[0], 10), _ca = parseInt(_cs[1], 10);
+    if (Number.isFinite(_ch) && Number.isFinite(_ca)) {
+      const _tot = _ch + _ca;
+      outcomeFinal = _ch > _ca ? '1' : _ch < _ca ? '2' : 'X';
+      winTextFinal = outcomeFinal === '1' ? 'Home Win' : outcomeFinal === '2' ? 'Away Win' : 'Draw';
+      // Over/Under 2.5 — binary market, so flip the probability if the score's
+      // total lands on the opposite side of pitch's original call.
+      const _over = _tot > 2.5;
+      const _newOu = _over ? 'Ov2.5' : 'Un2.5';
+      if (ouPredFinal && _newOu !== ouPredFinal && ouProbFinal != null) ouProbFinal = Math.max(1, Math.min(99, 100 - ouProbFinal));
+      ouPredFinal = _newOu;
+      ouLabelFinal = _over ? 'Over 2.5' : 'Under 2.5';
+      // Both-teams-to-score — same binary flip rule.
+      const _newBtts = (_ch > 0 && _ca > 0) ? 'Yes' : 'No';
+      if (bttsPredFinal && _newBtts !== bttsPredFinal && bttsProbFinal != null) bttsProbFinal = Math.max(1, Math.min(99, 100 - bttsProbFinal));
+      bttsPredFinal = _newBtts;
+    }
+
     // Country lives on the league object on pitchpredictions. The exact key
     // varies a bit across endpoints — check them all and fall back to top-level
     // r.country if present. This kills the league→country guesswork on the
@@ -482,12 +510,12 @@ function mapFixtureRow(r) {
       leagueLogo: (r.league && (r.league.logo || r.league.downloaded_league_logo)) || '',
       country,
       countryFlag: (r.league && (r.league.flag || r.league.country_flag)) || '',
-      prediction,
-      correctScore: predictScore(r.predictions, h, d, a, prediction, pick),
+      prediction: outcomeFinal,
+      correctScore,
       probHome: h,
       probDraw: d,
       probAway: a,
-      advice: [winText, ou].filter(Boolean).join(' · '),
+      advice: [winTextFinal, ouLabelFinal].filter(Boolean).join(' · '),
       hasOdds,
       // NEW fields for live timer + detail modal
       fixtureId: r.fixture_id || null,
@@ -498,10 +526,10 @@ function mapFixtureRow(r) {
       htScoreAway: r.score && r.score.half_time && r.score.half_time.away,
       recommendation: (r.predictions && r.predictions.recommendation) || '',
       avgGoals: (r.predictions && r.predictions.avg_goals) || null,
-      bttsPct: btts ? btts.probability : null,
-      bttsPred: btts ? btts.prediction : '',
-      ouPct: ouProb || null,
-      ouPred: ouPred || '',
+      bttsPct: bttsProbFinal,
+      bttsPred: bttsPredFinal,
+      ouPct: ouProbFinal,
+      ouPred: ouPredFinal,
       dcType: dc ? dc.type : '',
       dcPct: dc ? dc.probability : null,
       htProbHome: htProbs ? htProbs.home : null,
