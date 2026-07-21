@@ -105,12 +105,13 @@ const store = { matches: {}, preds: {} };
 // + last-matches data on demand when a user opens the detail modal.
 const matchUrls = {};
 
-// Cache for per-match H2H + standings scrapes — 6 h TTL so league standings stay
-// current through the day (they were going stale on a 24 h cache, showing old
-// matchday tables). Still avoids hammering pitchpredictions when the same match
-// modal is opened many times.
+// Cache for per-match H2H + standings scrapes — 2 h TTL so league tables refresh
+// a few times a matchday instead of sitting on yesterday's numbers (was 24 h, then
+// 6 h). These are fetched on demand via plain HTTPS (free — no Browserless), so a
+// shorter TTL only costs a few extra requests when a detail modal is reopened.
+// Override with MATCH_DETAIL_TTL_MIN if you want it fresher/cheaper.
 const matchDetailCache = new Map();  // fixtureId -> { fetchedAt, data }
-const MATCH_DETAIL_TTL_MS = 6 * 60 * 60 * 1000;
+const MATCH_DETAIL_TTL_MS = parseInt(process.env.MATCH_DETAIL_TTL_MIN || '120', 10) * 60 * 1000;
 
 // Global status (last successful scrape across ANY source).
 const status = {
@@ -190,7 +191,12 @@ function matchKey(home, away) {
 }
 
 // Minimal promise wrapper around https. Returns { status, text }.
-function httpRequest(method, urlString, { headers = {}, body = null, timeout = 60000 } = {}) {
+// maxRedirects opts a GET into following 30x hops (default 0 = old behaviour, so
+// POST callers are untouched). pitchpredictions answers some match URLs with a
+// 307 pointing at their canonical team-name spelling; without following it we
+// treated a perfectly good page as a failure and fell through to the paid
+// browser fallback — which is what was killing standings/H2H.
+function httpRequest(method, urlString, { headers = {}, body = null, timeout = 60000, maxRedirects = 0 } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlString);
     const payload = body == null ? null : typeof body === 'string' ? body : JSON.stringify(body);
@@ -202,6 +208,12 @@ function httpRequest(method, urlString, { headers = {}, body = null, timeout = 6
     const req = https.request(
       { hostname: u.hostname, path: u.pathname + u.search, method, headers: h },
       (res) => {
+        const loc = res.headers.location;
+        if (maxRedirects > 0 && loc && [301, 302, 303, 307, 308].includes(res.statusCode)) {
+          res.resume();                                    // drain so the socket frees
+          const next = new URL(loc, urlString).toString(); // handles relative Location
+          return resolve(httpRequest(method, next, { headers, body, timeout, maxRedirects: maxRedirects - 1 }));
+        }
         let raw = '';
         res.on('data', (c) => (raw += c));
         res.on('end', () => resolve({ status: res.statusCode, text: raw }));
@@ -246,6 +258,7 @@ async function fetchPageDirect(targetUrl) {
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
     },
+    maxRedirects: 5,   // follow pitch's 307 to the canonical match URL
   });
   if (code !== 200) throw new Error(`Direct HTTP ${code}: ${text.slice(0, 200)}`);
   if (!text || text.length < 200) throw new Error('Direct fetch returned empty/short HTML');
