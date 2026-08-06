@@ -1102,20 +1102,25 @@ app.use((req, res, next) => {
   next();
 });
 
-// Origin/Referer gate for DATA endpoints. Blocks:
-//   1. Curl/Postman without Origin (no Referer either) → 403
-//   2. Server-to-server scrapers that copy your Railway URL → 403
-//   3. Other domains spoofing CORS via residential proxies (Origin won't match) → 403
+// Origin/Referer gate for DATA endpoints. Purpose: stop OTHER websites from
+// hot-linking this API via browser fetch (their page always sends its real Origin,
+// which won't be whitelisted → blocked). It is NOT a scraper defense — a server can
+// send any header it likes — so it must never block legitimate app users.
 // Public endpoints (/, /api/health, /scrape-now) skip this so UptimeRobot still works.
 function originGate(req, res, next) {
   if (ALLOWED_ORIGINS.length === 0) return next();   // unrestricted until configured
   const origin  = req.headers.origin || '';
   const referer = req.headers.referer || '';
-  // Allow if EITHER the Origin OR the Referer resolves to a whitelisted host.
-  // In-app browsers (e.g. Telegram) often send "Origin: null" but a real Referer,
-  // so the referer fallback keeps those real users working.
+  // 1) A whitelisted Origin OR Referer always passes — normal browsers on our domain.
   if (originAllowed(origin) || originAllowed(referer)) return next();
-  console.warn(`[block] path=${req.path} origin=${origin || 'NONE'} referer=${referer || 'NONE'}`);
+  // 2) Missing Origin, or the literal "Origin: null", is NOT a cross-site attack — a
+  //    malicious page always sends its own real Origin, never null. This is an in-app
+  //    browser (Telegram / Facebook / Instagram webview), a direct navigation, or a
+  //    privacy-stripped client. Blocking it 403'd the whole detail panel (standings /
+  //    H2H / last matches) for a large share of real mobile users, so allow it through.
+  if (!origin || origin === 'null') return next();
+  // 3) A concrete foreign Origin that isn't whitelisted → block (anti-hotlink).
+  console.warn(`[block] path=${req.path} origin=${origin} referer=${referer || 'NONE'}`);
   return res.status(403).json({ error: 'forbidden — invalid origin' });
 }
 
