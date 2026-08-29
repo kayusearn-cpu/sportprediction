@@ -414,14 +414,19 @@ function predictScore(preds, h, d, a, result, pick) {
 // A live-games datapoint stays "fresh" a bit longer than its own poll interval, so a
 // single missed poll never drops a match out of LIVE.
 const LIVE_FRESH_MS = (LIVE_GAMES_MIN * 2 + 3) * 60 * 1000;
-function effectiveStatus(date, time, srcStatus, hasLive, elapsedAt) {
-  // 1) FRESH live-games data ALWAYS wins. The live feed reported this match in-play
-  //    moments ago, so it IS live — even if the fixture's stored kickoff time is wrong.
-  //    (pitch's date API and live feed sometimes disagree on kickoff by hours, which
-  //    was making genuinely-live matches get force-marked FT by the time math below.)
-  if (elapsedAt && (Date.now() - elapsedAt) < LIVE_FRESH_MS) return 'LIVE';
+function effectiveStatus(date, time, srcStatus, hasLive, elapsedAt, statusRaw) {
+  const raw = String(statusRaw || '').toUpperCase();
+  const finishedRaw = ['FT', 'AET', 'PEN'].includes(raw);
+  const inPlayRaw = !finishedRaw && (['1H', '2H', 'HT', 'ET', 'BT', 'P', 'LIVE'].includes(raw) || /^\d/.test(raw));
+  // 1) Source currently reports the match IN-PLAY and that report is fresh → LIVE. This
+  //    wins over the kickoff-time math below, so a genuinely-live match is never
+  //    force-marked FT because its stored kickoff time is stale/wrong (pitch's date feed
+  //    and live feed sometimes disagree on kickoff by hours). We must ALSO require the
+  //    in-play status — finished matches also carry a fresh elapsed=90, so "fresh
+  //    elapsed" alone would wrongly light them up as live.
+  if (inPlayRaw && elapsedAt && (Date.now() - elapsedAt) < LIVE_FRESH_MS) return 'LIVE';
   // 2) An explicitly finished match stays finished.
-  if (srcStatus === 'FT') return 'FT';
+  if (finishedRaw || srcStatus === 'FT') return 'FT';
   // 3) Otherwise infer from kickoff time (for sources that only give a scheduled time).
   if (!date || !time) return srcStatus || 'NS';
   const t = Date.parse(`${date}T${time}:00Z`);
@@ -801,7 +806,7 @@ function mergeIntoCache(list) {
   let merged = 0;
   for (const p of list) {
     if (!p.homeTeam || !p.awayTeam) continue;
-    p.status = effectiveStatus(p.date, p.time, p.status, hasLiveSignal(p), p.elapsed != null ? Date.now() : p.elapsedAt);
+    p.status = effectiveStatus(p.date, p.time, p.status, hasLiveSignal(p), p.elapsed != null ? Date.now() : p.elapsedAt, p.statusRaw);
     if (ONLY_WITH_ODDS && !p.hasOdds && p.status === 'NS') continue;
     const k = matchKey(p.homeTeam, p.awayTeam);
     // Fall back to the previous prediction if this row arrives without one (e.g. a
@@ -874,7 +879,7 @@ function mergeIntoCache(list) {
   // so a fixture whose kickoff merely passed never becomes a data-less fake "live".
   for (const k of Object.keys(newMatches)) {
     const m = newMatches[k];
-    m.status = effectiveStatus(m.date, m.time, m.status, hasLiveSignal(m), m.elapsedAt);
+    m.status = effectiveStatus(m.date, m.time, m.status, hasLiveSignal(m), m.elapsedAt, m.statusRaw);
   }
   // Eviction policy:
   //   - Finished matches (FT) are kept for HISTORY_DAYS so we can build H2H + Last Matches
