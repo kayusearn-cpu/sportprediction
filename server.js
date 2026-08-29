@@ -411,8 +411,18 @@ function predictScore(preds, h, d, a, result, pick) {
 // in-play status). A match whose kickoff time has merely passed — with no minute
 // and no score — must NOT be shown as a broken "live" match with an empty timer;
 // it stays upcoming until real data arrives, then flips to FT once clearly over.
-function effectiveStatus(date, time, srcStatus, hasLive) {
+// A live-games datapoint stays "fresh" a bit longer than its own poll interval, so a
+// single missed poll never drops a match out of LIVE.
+const LIVE_FRESH_MS = (LIVE_GAMES_MIN * 2 + 3) * 60 * 1000;
+function effectiveStatus(date, time, srcStatus, hasLive, elapsedAt) {
+  // 1) FRESH live-games data ALWAYS wins. The live feed reported this match in-play
+  //    moments ago, so it IS live — even if the fixture's stored kickoff time is wrong.
+  //    (pitch's date API and live feed sometimes disagree on kickoff by hours, which
+  //    was making genuinely-live matches get force-marked FT by the time math below.)
+  if (elapsedAt && (Date.now() - elapsedAt) < LIVE_FRESH_MS) return 'LIVE';
+  // 2) An explicitly finished match stays finished.
   if (srcStatus === 'FT') return 'FT';
+  // 3) Otherwise infer from kickoff time (for sources that only give a scheduled time).
   if (!date || !time) return srcStatus || 'NS';
   const t = Date.parse(`${date}T${time}:00Z`);
   if (isNaN(t)) return srcStatus || 'NS';
@@ -791,7 +801,7 @@ function mergeIntoCache(list) {
   let merged = 0;
   for (const p of list) {
     if (!p.homeTeam || !p.awayTeam) continue;
-    p.status = effectiveStatus(p.date, p.time, p.status, hasLiveSignal(p));
+    p.status = effectiveStatus(p.date, p.time, p.status, hasLiveSignal(p), p.elapsed != null ? Date.now() : p.elapsedAt);
     if (ONLY_WITH_ODDS && !p.hasOdds && p.status === 'NS') continue;
     const k = matchKey(p.homeTeam, p.awayTeam);
     // Fall back to the previous prediction if this row arrives without one (e.g. a
@@ -864,7 +874,7 @@ function mergeIntoCache(list) {
   // so a fixture whose kickoff merely passed never becomes a data-less fake "live".
   for (const k of Object.keys(newMatches)) {
     const m = newMatches[k];
-    m.status = effectiveStatus(m.date, m.time, m.status, hasLiveSignal(m));
+    m.status = effectiveStatus(m.date, m.time, m.status, hasLiveSignal(m), m.elapsedAt);
   }
   // Eviction policy:
   //   - Finished matches (FT) are kept for HISTORY_DAYS so we can build H2H + Last Matches
