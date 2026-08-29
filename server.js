@@ -407,15 +407,30 @@ function predictScore(preds, h, d, a, result, pick) {
   return scorelineFor(homeXg, awayXg, result, pick);
 }
 // Infer real status from kickoff time so the front-end can bucket matches correctly.
-function effectiveStatus(date, time, srcStatus) {
+// `hasLive` = we actually have live data (a running minute, a score, or a real
+// in-play status). A match whose kickoff time has merely passed — with no minute
+// and no score — must NOT be shown as a broken "live" match with an empty timer;
+// it stays upcoming until real data arrives, then flips to FT once clearly over.
+function effectiveStatus(date, time, srcStatus, hasLive) {
   if (srcStatus === 'FT') return 'FT';
   if (!date || !time) return srcStatus || 'NS';
   const t = Date.parse(`${date}T${time}:00Z`);
   if (isNaN(t)) return srcStatus || 'NS';
   const minutesPast = (Date.now() - t) / 60000;
   if (minutesPast < 0) return 'NS';
-  if (minutesPast < 150) return 'LIVE';
+  if (minutesPast < 150) return hasLive ? 'LIVE' : 'NS';
   return 'FT';
+}
+// True when a match record carries a genuine live signal (minute / score / in-play
+// status), so we never promote a data-less fixture to "live".
+function hasLiveSignal(m) {
+  if (!m) return false;
+  const raw = String(m.statusRaw || '').toUpperCase();
+  if (m.elapsed != null) return true;
+  if (m.home && m.home.score != null && m.away && m.away.score != null) return true;
+  if (typeof m.score === 'string' && /\d\s*-\s*\d/.test(m.score)) return true;   // mapped row form
+  if (/^\d/.test(raw)) return true;
+  return ['1H', '2H', 'HT', 'ET', 'BT', 'P', 'LIVE'].includes(raw);
 }
 function extractFromNextData(html) {
   const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
@@ -776,7 +791,7 @@ function mergeIntoCache(list) {
   let merged = 0;
   for (const p of list) {
     if (!p.homeTeam || !p.awayTeam) continue;
-    p.status = effectiveStatus(p.date, p.time, p.status);
+    p.status = effectiveStatus(p.date, p.time, p.status, hasLiveSignal(p));
     if (ONLY_WITH_ODDS && !p.hasOdds && p.status === 'NS') continue;
     const k = matchKey(p.homeTeam, p.awayTeam);
     // Fall back to the previous prediction if this row arrives without one (e.g. a
@@ -844,9 +859,12 @@ function mergeIntoCache(list) {
     };
     merged++;
   }
-  // Re-infer status for ALL cached matches so NS → LIVE → FT progresses over time.
+  // Re-infer status for ALL cached matches so NS → LIVE → FT progresses over time —
+  // but only promote to LIVE when the match actually has live data (hasLiveSignal),
+  // so a fixture whose kickoff merely passed never becomes a data-less fake "live".
   for (const k of Object.keys(newMatches)) {
-    newMatches[k].status = effectiveStatus(newMatches[k].date, newMatches[k].time, newMatches[k].status);
+    const m = newMatches[k];
+    m.status = effectiveStatus(m.date, m.time, m.status, hasLiveSignal(m));
   }
   // Eviction policy:
   //   - Finished matches (FT) are kept for HISTORY_DAYS so we can build H2H + Last Matches
@@ -1159,24 +1177,36 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Memoized /api/scores body. Rebuilt at most every 30 s. Building the payload
+// per-request meant JSON.stringify-ing thousands of matches inline on the single
+// Node thread — under traffic that blocked the event loop, which is why country
+// scrapes were timing out. Now every visitor in a 30 s window shares one prebuilt
+// string, so the endpoint stays cheap no matter how many people hit it at once.
+let _scoresCache = { body: null, at: 0 };
 app.get('/api/scores', originGate, (req, res) => {
-  // 60-second cache. Browsers + Cloudflare/Netlify CDN reuse this response,
-  // dropping Railway load by ~99% under high traffic. Sports data is fine with
-  // a 1-minute stale window (your scraper refreshes every 5 min anyway).
-  //   public           = anyone can cache (response isn't user-specific)
-  //   max-age=60       = browser caches for 60 seconds
-  //   s-maxage=60      = shared/CDN caches for 60 seconds
-  //   stale-while-rev. = serve stale data while fetching fresh in background (smooth UX)
   res.set('Cache-Control', 'public, max-age=60, s-maxage=60, stale-while-revalidate=30');
-  const matches = Object.entries(store.matches).map(([key, m]) => {
+  res.type('application/json');
+  const now = Date.now();
+  if (_scoresCache.body && now - _scoresCache.at < 30000) return res.send(_scoresCache.body);
+
+  // Only ship a useful date window + anything live. The full HISTORY_DAYS of finished
+  // matches stays in the in-memory cache (it powers H2H) but must NOT go over the wire —
+  // shipping all of it bloated the response to ~12 MB. The window covers the whole date
+  // strip (past 5 → next 10 days) with margin, so nothing the UI can show is dropped.
+  const lo = isoDateOffset(-6), hi = isoDateOffset(11);
+  const matches = [];
+  for (const key in store.matches) {
+    const m = store.matches[key];
+    if (m.status !== 'LIVE' && !(m.date >= lo && m.date <= hi)) continue;
     const p = store.preds[key];
-    return {
+    matches.push({
       ...m,
       probabilities: p ? { home: p.h + '%', draw: p.d + '%', away: p.a + '%' } : null,
       tip: m.prediction ? `${m.prediction}${m.correctScore ? ' (' + m.correctScore + ')' : ''}` : '',
-    };
-  });
-  res.json({ updatedAt: status.lastOk, count: matches.length, matches });
+    });
+  }
+  _scoresCache = { body: JSON.stringify({ updatedAt: status.lastOk, count: matches.length, matches }), at: now };
+  res.send(_scoresCache.body);
 });
 
 // Manual trigger — scrapes ALL sources at once. Protected by ADMIN_KEY when set.
