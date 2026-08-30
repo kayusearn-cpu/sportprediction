@@ -105,13 +105,13 @@ const store = { matches: {}, preds: {} };
 // + last-matches data on demand when a user opens the detail modal.
 const matchUrls = {};
 
-// Cache for per-match H2H + standings scrapes — 2 h TTL so league tables refresh
-// a few times a matchday instead of sitting on yesterday's numbers (was 24 h, then
-// 6 h). These are fetched on demand via plain HTTPS (free — no Browserless), so a
-// shorter TTL only costs a few extra requests when a detail modal is reopened.
-// Override with MATCH_DETAIL_TTL_MIN if you want it fresher/cheaper.
+// Cache for per-match H2H + standings scrapes — 10 min TTL so league tables refresh
+// within ~10 min of a result instead of sitting on stale numbers. These are fetched
+// on demand via plain HTTPS (free — no Browserless) only when a user opens a match,
+// so a shorter TTL just costs a re-scrape of that one match when reopened after 10 min.
+// Override with MATCH_DETAIL_TTL_MIN (minutes) to make it fresher or lighter.
 const matchDetailCache = new Map();  // fixtureId -> { fetchedAt, data }
-const MATCH_DETAIL_TTL_MS = parseInt(process.env.MATCH_DETAIL_TTL_MIN || '120', 10) * 60 * 1000;
+const MATCH_DETAIL_TTL_MS = parseInt(process.env.MATCH_DETAIL_TTL_MIN || '10', 10) * 60 * 1000;
 
 // Global status (last successful scrape across ANY source).
 const status = {
@@ -1016,16 +1016,25 @@ async function runFullScrape(trigger = 'manual') {
   return { count: status.lastCount, sources: results };
 }
 
-// Tiered scheduler: each source on its OWN interval. Lower Browserless usage,
-// same data coverage. Sources are staggered a few seconds apart on boot so we
-// don't slam Browserless all at once.
+// Tiered scheduler — GENTLE MODE. Every source's FIRST run is spaced SCRAPE_GAP_SEC
+// apart (live tier first so scores/fixtures are fresh fast, then future, then past),
+// and each recurring run inherits that same phase. This means we NEVER hit
+// pitchpredictions with a burst: not all 28 sources at once on boot, and — the big
+// one — not all ~20 country feeds at the same instant every hour (which is what got
+// the server's IP Cloudflare-blocked). Requests trickle out one every ~15s instead.
 function startTieredScheduler() {
-  const sources = getSources();
-  console.log(`[scheduler] ${sources.length} source(s) scheduled:`);
+  const tierRank = { live: 0, future: 1, past: 2, primary: 3 };
+  const sources = getSources().slice().sort((a, b) => (tierRank[a.tier] ?? 9) - (tierRank[b.tier] ?? 9));
+  const GAP_MS = Math.max(3, parseInt(process.env.SCRAPE_GAP_SEC || '15', 10)) * 1000;
+  console.log(`[scheduler] ${sources.length} source(s) scheduled — staggered ${GAP_MS / 1000}s apart (live tier first):`);
   sources.forEach((src, i) => {
     console.log(`   ${src.name.padEnd(10)} every ${String(src.intervalMin).padStart(4)} min  (${src.useBrowser ? 'browser' : 'direct '})  tier=${src.tier}`);
-    setTimeout(() => scrapeOne(src, 'boot'), 3000 + i * 4000);
-    setInterval(() => scrapeOne(src, 'scheduler'), src.intervalMin * 60 * 1000);
+    setTimeout(() => {
+      scrapeOne(src, 'boot');
+      // Start the recurring timer AFTER this source's own staggered first run, so
+      // same-interval sources stay phase-shifted and never fire all together again.
+      setInterval(() => scrapeOne(src, 'scheduler'), src.intervalMin * 60 * 1000);
+    }, 2000 + i * GAP_MS);
   });
 }
 
