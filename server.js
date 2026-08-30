@@ -61,12 +61,12 @@ const PORT = process.env.PORT || 3000;
 // LIVE_REFRESH_MIN bumped from 10 → 5 so live scores update twice as fast.
 // Still free (plain HTTPS to pitchpredictions, no Browserless token cost).
 const LEGACY_REFRESH = parseInt(process.env.REFRESH_MINUTES || '5', 10);
-const LIVE_REFRESH_MIN = parseInt(process.env.LIVE_REFRESH_MIN || String(LEGACY_REFRESH), 10);
-const FUTURE_REFRESH_MIN = parseInt(process.env.FUTURE_REFRESH_MIN || '60', 10);
+const LIVE_REFRESH_MIN = parseInt(process.env.LIVE_REFRESH_MIN || '20', 10);
+const FUTURE_REFRESH_MIN = parseInt(process.env.FUTURE_REFRESH_MIN || '180', 10);
 const PAST_REFRESH_MIN = parseInt(process.env.PAST_REFRESH_MIN || '360', 10);
 // The dedicated live-games feed is tiny (~12 rows) and cheap, so poll it fast so
 // in-play scores/minutes actually move. Default 3 min (override LIVE_GAMES_MIN).
-const LIVE_GAMES_MIN = parseInt(process.env.LIVE_GAMES_MIN || '3', 10);
+const LIVE_GAMES_MIN = parseInt(process.env.LIVE_GAMES_MIN || '4', 10);
 
 const TARGET_URL = process.env.TARGET_URL || 'https://www.forebet.com/en/football-tips-and-predictions-for-today';
 const FALLBACK_URL = process.env.FALLBACK_URL || 'https://www.pitchpredictions.com';
@@ -675,21 +675,64 @@ function offsetLabel(off) {
   return off > 0 ? `plus${off}d` : `minus${-off}d`;
 }
 
+// --- Cloudflare bypass for the JSON API ------------------------------------
+// pitchpredictions sits behind Cloudflare, which 403s ("Just a moment") datacenter
+// IPs like Railway's. Browserless's RESIDENTIAL proxy uses a home-broadband IP that
+// Cloudflare waves through; Chrome renders the raw JSON body inside a <pre>, so we
+// pull that out and parse it. Costs ~1 Browserless unit per call — used ONLY when
+// the FREE direct fetch is blocked.
+function htmlDecode(s) {
+  return String(s)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');   // ampersand last, so we don't double-decode
+}
+
+async function fetchApiJsonViaBrowser(targetUrl) {
+  if (!BROWSERLESS_TOKEN) throw new Error('BROWSERLESS_TOKEN not set (needed for residential proxy)');
+  const proxy = process.env.BROWSERLESS_PROXY || 'residential';
+  let url = `https://${BROWSERLESS_HOST}/content?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`
+          + `&proxy=${encodeURIComponent(proxy)}&proxySticky=true`;
+  if (process.env.PROXY_COUNTRY) url += `&proxyCountry=${encodeURIComponent(process.env.PROXY_COUNTRY)}`;
+  const payload = { url: targetUrl, gotoOptions: { waitUntil: 'domcontentloaded', timeout: 30000 } };
+  const { status: code, text } = await httpRequest('POST', url, { body: payload, timeout: 60000 });
+  if (code !== 200) throw new Error(`Browserless ${code}: ${String(text).slice(0, 120)}`);
+  const m = String(text).match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
+  const jsonText = m ? htmlDecode(m[1]) : text;
+  let json;
+  try { json = JSON.parse(jsonText); } catch (e) { throw new Error('Browserless returned non-JSON'); }
+  return json;
+}
+
+// Fetch a pitch JSON endpoint: FREE direct first (used whenever the IP isn't
+// blocked), then fall back to the residential proxy on ANY failure. Returns the
+// parsed JSON object (with its .data array).
+async function fetchPitchApi(targetUrl) {
+  try {
+    const { status: code, text } = await httpRequest('GET', targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Origin': 'https://www.pitchpredictions.com',
+        'Referer': 'https://www.pitchpredictions.com/',
+      },
+    });
+    if (code === 200) {
+      const json = JSON.parse(text);
+      if (json && Array.isArray(json.data)) return json;
+    }
+    throw new Error(`direct ${code}`);
+  } catch (e) {
+    if (!BROWSERLESS_TOKEN) throw e;
+    return await fetchApiJsonViaBrowser(targetUrl);
+  }
+}
+
 // Call the JSON API for a whole date. Same fixture shape as the page data, so we
 // reuse mapFixtureRow. ~51 fixtures, all countries, with odds.
 async function fetchFixturesByDate(dateStr) {
   const url = `${PP_API}/fetch_fixtures_by_date?fixture_date=${encodeURIComponent(dateStr)}`;
-  const { status: code, text } = await httpRequest('GET', url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-      'Accept': 'application/json',
-      'Origin': 'https://www.pitchpredictions.com',
-      'Referer': 'https://www.pitchpredictions.com/',
-    },
-  });
-  if (code !== 200) throw new Error(`API HTTP ${code}: ${text.slice(0, 160)}`);
-  let json;
-  try { json = JSON.parse(text); } catch (e) { throw new Error('API returned non-JSON'); }
+  const json = await fetchPitchApi(url);
   if (!json || !Array.isArray(json.data)) throw new Error('API: no data array');
   return json.data.map(mapFixtureRow);
 }
@@ -700,17 +743,7 @@ async function fetchFixturesByDate(dateStr) {
 // list (same shape → mapFixtureRow).
 async function fetchLeagueFixtures(leagueId) {
   const url = `${PP_API}/fetch_league_fixtures?league_id=${encodeURIComponent(leagueId)}`;
-  const { status: code, text } = await httpRequest('GET', url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-      'Accept': 'application/json',
-      'Origin': 'https://www.pitchpredictions.com',
-      'Referer': 'https://www.pitchpredictions.com/',
-    },
-  });
-  if (code !== 200) throw new Error(`League API HTTP ${code}: ${text.slice(0, 160)}`);
-  let json;
-  try { json = JSON.parse(text); } catch (e) { throw new Error('League API returned non-JSON'); }
+  const json = await fetchPitchApi(url);
   if (!json || !Array.isArray(json.data)) throw new Error('League API: no data array');
   return json.data.map(mapFixtureRow);
 }
@@ -722,17 +755,7 @@ async function fetchLeagueFixtures(leagueId) {
 // Same fixture shape (predictions included) → mapFixtureRow.
 async function fetchLiveGames() {
   const url = `${PP_API}/fetch_live_games`;
-  const { status: code, text } = await httpRequest('GET', url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-      'Accept': 'application/json',
-      'Origin': 'https://www.pitchpredictions.com',
-      'Referer': 'https://www.pitchpredictions.com/',
-    },
-  });
-  if (code !== 200) throw new Error(`Live API HTTP ${code}: ${text.slice(0, 160)}`);
-  let json;
-  try { json = JSON.parse(text); } catch (e) { throw new Error('Live API returned non-JSON'); }
+  const json = await fetchPitchApi(url);
   if (!json || !Array.isArray(json.data)) throw new Error('Live API: no data array');
   return json.data.map(mapFixtureRow);
 }
@@ -742,8 +765,12 @@ async function fetchLiveGames() {
 // high-volume countries; override via the COUNTRY_FEEDS env var.
 // "world" carries World Cup + international club friendlies (the "top matches"),
 // which the date API caps out — keep it near the front so it's always pulled.
-const COUNTRY_FEEDS = (process.env.COUNTRY_FEEDS ||
-  'world,argentina,brazil,chile,mexico,colombia,usa,sweden,norway,spain,england,italy,germany,france,china,japan,tanzania,syria,lebanon,mongolia,lithuania')
+// Country PAGE feeds are OFF by default now: each is a heavy page fetch that, when
+// the datacenter IP is Cloudflare-blocked, has to go through the residential proxy —
+// far more Browserless units than the small JSON endpoints. The date API + live-games
+// cover the core slate. Re-enable a few later via COUNTRY_FEEDS=england,spain,italy
+// once you've seen how much of your 20k units the core sources actually use.
+const COUNTRY_FEEDS = (process.env.COUNTRY_FEEDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 // Specific competitions pulled by league_id (fetch_league_fixtures) — the date
