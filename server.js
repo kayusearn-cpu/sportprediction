@@ -708,24 +708,29 @@ async function fetchApiJsonViaBrowser(targetUrl) {
 // blocked), then fall back to the residential proxy on ANY failure. Returns the
 // parsed JSON object (with its .data array).
 async function fetchPitchApi(targetUrl) {
-  try {
-    const { status: code, text } = await httpRequest('GET', targetUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Origin': 'https://www.pitchpredictions.com',
-        'Referer': 'https://www.pitchpredictions.com/',
-      },
-    });
-    if (code === 200) {
-      const json = JSON.parse(text);
-      if (json && Array.isArray(json.data)) return json;
-    }
-    throw new Error(`direct ${code}`);
-  } catch (e) {
-    if (!BROWSERLESS_TOKEN) throw e;
-    return await fetchApiJsonViaBrowser(targetUrl);
-  }
+  // As of 2026-08-30 pitch's API rejects any request that doesn't look like the site's
+  // OWN same-site browser fetch — otherwise it 403s "Missing or invalid API token".
+  // The decisive header is `Sec-Fetch-Site: same-site`: a browser only sets it on a
+  // same-origin-family fetch (which is why a proxied page NAVIGATION can't fake it and
+  // Browserless is useless here), but a plain server request can send it outright. With
+  // this header set we look like www.pitchpredictions.com calling its own API, so the
+  // datacenter request just works — no Browserless units, no proxy.
+  const { status: code, text } = await httpRequest('GET', targetUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept': 'application/json',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin': 'https://www.pitchpredictions.com',
+      'Referer': 'https://www.pitchpredictions.com/',
+      'Sec-Fetch-Site': 'same-site',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty',
+    },
+  });
+  if (code !== 200) throw new Error(`API HTTP ${code}: ${String(text).slice(0, 120)}`);
+  let json;
+  try { json = JSON.parse(text); } catch (e) { throw new Error('API returned non-JSON'); }
+  return json;
 }
 
 // Call the JSON API for a whole date. Same fixture shape as the page data, so we
