@@ -550,6 +550,7 @@ function mapFixtureRow(r) {
       score: liveScore,
       status: s,
       league: (r.league && r.league.name) || '',
+      leagueId: r.league_id != null ? r.league_id : ((r.league && r.league.id != null) ? r.league.id : null),
       leagueLogo: (r.league && (r.league.logo || r.league.downloaded_league_logo)) || '',
       country,
       countryFlag: (r.league && (r.league.flag || r.league.country_flag)) || '',
@@ -866,6 +867,7 @@ function mergeIntoCache(list) {
         id: p.awayTeamId != null ? p.awayTeamId : (prev.away && prev.away.id) || null,
       },
       leagueName: p.league || '',
+      leagueId: p.leagueId != null ? p.leagueId : (prev.leagueId != null ? prev.leagueId : null),
       leagueLogo: p.leagueLogo || '',
       country: p.country || prev.country || '',
       countryFlag: p.countryFlag || prev.countryFlag || '',
@@ -1497,6 +1499,49 @@ async function fetchPPMatchDetails(fixtureId, homeName, awayName) {
   return out;
 }
 
+// League standings via the dedicated JSON API (POST fetch_team_standings). This is FAR
+// more reliable than scraping standings out of the heavy per-match page — pitch serves
+// the table straight up, no Browserless. Returns the SAME [[{row}…]] shape the detail
+// endpoint already trims (row has rank/team/all.goals/points/goalsDiff/form/description).
+// Cached per league because a table only changes a few times a matchday.
+const standingsCache = new Map();  // leagueId -> { at, data }
+const STANDINGS_TTL_MS = parseInt(process.env.STANDINGS_TTL_MIN || '30', 10) * 60 * 1000;
+async function fetchLeagueStandings(leagueId) {
+  if (leagueId == null || leagueId === '') return null;
+  const key = String(leagueId);
+  const hit = standingsCache.get(key);
+  if (hit && (Date.now() - hit.at) < STANDINGS_TTL_MS) return hit.data;
+  let json;
+  try {
+    const { status: code, text } = await httpRequest('POST', `${PP_API}/fetch_team_standings`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://www.pitchpredictions.com',
+        'Referer': 'https://www.pitchpredictions.com/',
+        'Sec-Fetch-Site': 'same-site',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Dest': 'empty',
+      },
+      body: { league_id: leagueId },
+    });
+    if (code !== 200) return null;
+    json = JSON.parse(text);
+  } catch (e) { return null; }
+  if (!json || json.status !== true || !Array.isArray(json.data)) return null;
+  // Prefer the group whose league_id matches; parse its standings_data JSON string.
+  const group = json.data.find((g) => String(g.league_id) === key) || json.data[0];
+  if (!group || !group.standings_data) return null;
+  let parsed;
+  try {
+    parsed = typeof group.standings_data === 'string' ? JSON.parse(group.standings_data) : group.standings_data;
+  } catch (e) { return null; }
+  if (!Array.isArray(parsed) || !parsed.length) return null;
+  standingsCache.set(key, { at: Date.now(), data: parsed });
+  return parsed;
+}
+
 // Convert pitchpredictions H2H match row into our standard shape.
 function convertPpH2H(m, requestedHomeName, requestedHomeId) {
   const goalsH = m.ft_goals_home, goalsA = m.ft_goals_away;
@@ -1582,11 +1627,12 @@ app.get('/api/match/:id/details', originGate, async (req, res) => {
   let h2hList = h2hMatches(homeName, awayName, homeId, awayId, limit, id);
   let externalSource = null;
   let standings = null;
+  let extStandings = null;  // standings scraped from the page — fallback only
 
-  // 2. Always call fetchPPMatchDetails when we have a fixture_id — even if H2H is
-  //    filled locally — because STANDINGS data only comes from per-match pages.
-  //    The 6h cache prevents abuse.
-  if (fixtureId) {
+  // 2. Only scrape the per-match page (Browserless) when our local cache can't fill
+  //    H2H / last-6. Standings now come from the reliable JSON API below, so we no
+  //    longer pay for a page-load just to get the table.
+  if (fixtureId && (h2hList.length === 0 || homeLast.length === 0 || awayLast.length === 0)) {
     try {
       const ext = await fetchPPMatchDetails(fixtureId, homeName, awayName);
       if (ext) {
@@ -1612,34 +1658,41 @@ app.get('/api/match/:id/details', originGate, async (req, res) => {
             .sort((a, b) => b.kickoffMs - a.kickoffMs)
             .slice(0, limit);
         }
-        // Trim standings to essentials so we don't ship a huge payload.
-        if (Array.isArray(ext.standings) && ext.standings.length) {
-          standings = ext.standings.map((group) =>
-            (Array.isArray(group) ? group : []).map((row) => ({
-              rank: row.rank,
-              teamId: row.team && row.team.id,
-              teamName: row.team && row.team.name,
-              teamLogo: row.team && row.team.logo,
-              group: row.group || '',
-              played: row.all && row.all.played,
-              win: row.all && row.all.win,
-              draw: row.all && row.all.draw,
-              lose: row.all && row.all.lose,
-              gf: row.all && row.all.goals && row.all.goals.for,
-              ga: row.all && row.all.goals && row.all.goals.against,
-              gd: row.goalsDiff,
-              points: row.points,
-              form: row.form || '',
-              description: row.description || '',
-              isHomeTeam: row.team && row.team.id === homeId,
-              isAwayTeam: row.team && row.team.id === awayId,
-            }))
-          );
-        }
+        // Keep page standings only as a fallback; the JSON API below is preferred.
+        if (Array.isArray(ext.standings) && ext.standings.length) extStandings = ext.standings;
       }
     } catch (e) {
       console.error('[pp-details] error:', e.message);
     }
+  }
+
+  // Standings — reliable JSON API by league_id first, page-scrape as fallback. Both are
+  // the same [[{row}…]] shape, so one trim handles either source.
+  let rawStandings = null;
+  try { rawStandings = await fetchLeagueStandings(m.leagueId); } catch (e) {}
+  if (!Array.isArray(rawStandings) || !rawStandings.length) rawStandings = extStandings;
+  if (Array.isArray(rawStandings) && rawStandings.length) {
+    standings = rawStandings.map((group) =>
+      (Array.isArray(group) ? group : []).map((row) => ({
+        rank: row.rank,
+        teamId: row.team && row.team.id,
+        teamName: row.team && row.team.name,
+        teamLogo: row.team && row.team.logo,
+        group: row.group || '',
+        played: row.all && row.all.played,
+        win: row.all && row.all.win,
+        draw: row.all && row.all.draw,
+        lose: row.all && row.all.lose,
+        gf: row.all && row.all.goals && row.all.goals.for,
+        ga: row.all && row.all.goals && row.all.goals.against,
+        gd: row.goalsDiff,
+        points: row.points,
+        form: row.form || '',
+        description: row.description || '',
+        isHomeTeam: row.team && row.team.id === homeId,
+        isAwayTeam: row.team && row.team.id === awayId,
+      }))
+    );
   }
 
   const stats = h2hStats(h2hList);
