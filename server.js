@@ -1263,7 +1263,10 @@ app.get('/api/scores', originGate, (req, res) => {
       tip: m.prediction ? `${m.prediction}${m.correctScore ? ' (' + m.correctScore + ')' : ''}` : '',
     });
   }
-  _scoresCache = { body: JSON.stringify({ updatedAt: status.lastOk, count: matches.length, matches }), at: now };
+  // serverTime lets the frontend anchor "today" to the server's real clock instead of
+  // the visitor's device clock — a wrong device date (e.g. set weeks ahead) otherwise
+  // makes the whole site label the wrong day. Built here so it's at most 30 s stale.
+  _scoresCache = { body: JSON.stringify({ serverTime: new Date().toISOString(), updatedAt: status.lastOk, count: matches.length, matches }), at: now };
   res.send(_scoresCache.body);
 });
 
