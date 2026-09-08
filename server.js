@@ -936,6 +936,36 @@ function mergeIntoCache(list) {
       }
     }
   }
+  // Sanitizer — kill impossible same-day duplicate fixtures. pitch's date API sometimes
+  // dumps an ENTIRE league-phase fixture list onto a single day (observed: all ~51
+  // Champions League fixtures for the whole season stamped "today", so Inter shows up
+  // vs Stuttgart, Shakhtar, Club Brugge AND Liverpool at the same 19:00). A team plays
+  // at most once per calendar day, so any not-yet-played fixture whose home or away team
+  // appears in 2+ NS fixtures that same day is bogus. Drop them all. A real daily slate
+  // never trips this (no team plays twice a day), so legitimate fixtures are untouched;
+  // the mis-dated dump trips it on essentially every row and clears itself out.
+  {
+    const dayTeamCount = {};   // date -> { teamName -> count } across NS fixtures only
+    for (const k of Object.keys(newMatches)) {
+      const m = newMatches[k];
+      if (m.status !== 'NS' || !m.date) continue;
+      const c = (dayTeamCount[m.date] = dayTeamCount[m.date] || {});
+      c[m.home.name] = (c[m.home.name] || 0) + 1;
+      c[m.away.name] = (c[m.away.name] || 0) + 1;
+    }
+    let purged = 0;
+    for (const k of Object.keys(newMatches)) {
+      const m = newMatches[k];
+      if (m.status !== 'NS' || !m.date) continue;
+      const c = dayTeamCount[m.date] || {};
+      if (c[m.home.name] > 1 || c[m.away.name] > 1) {
+        delete newMatches[k];
+        delete newPreds[k];
+        purged++;
+      }
+    }
+    if (purged) console.log(`[sanitize] dropped ${purged} impossible same-day duplicate NS fixture(s) (mis-dated feed dump)`);
+  }
   store.matches = newMatches;
   store.preds = newPreds;
   return merged;
