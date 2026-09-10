@@ -1575,6 +1575,110 @@ async function fetchLeagueStandings(leagueId) {
   return parsed;
 }
 
+// ============================================================================
+// Forebet standings — pitch's fetch_team_standings is stuck on LAST season (it
+// returns the completed prior-season final table, e.g. EPL 38 games played, and
+// ignores a season param), so CURRENT-season league tables come from forebet.com.
+// Forebet is Cloudflare-protected, so we render it through Browserless in STEALTH
+// mode (the only mode that clears the challenge from a datacenter IP) and wait for
+// the #standings table before grabbing the HTML. Teams are matched to our
+// api-sports names by normalised-token overlap (Forebet has no api-sports IDs).
+// ============================================================================
+
+// api-sports league_id -> Forebet "<country>/<league-slug>" (slugs verified live).
+const FOREBET_LEAGUES = {
+  39:'england/premier-league', 40:'england/championship',
+  140:'spain/primera-division', 141:'spain/segunda-division',
+  135:'italy/serie-a', 136:'italy/serie-b',
+  78:'germany/bundesliga', 79:'germany/2-bundesliga',
+  61:'france/ligue1', 62:'france/ligue2',
+  94:'portugal/liga-portugal',
+  88:'netherlands/eredivisie', 89:'netherlands/erstedivision',
+  144:'belgium/jupiler-pro-league',
+  203:'turkey/super-lig',
+  71:'brazil/serie-a', 72:'brazil/serie-b',
+  128:'argentina/liga-profesional',
+  253:'usa/mls',
+  179:'scotland/premiership',
+  197:'greece/super-league',
+  307:'saudi-arabia/professional-league',
+};
+
+const forebetCache = new Map();  // leagueId -> { at, data }  (data:null caches a miss)
+const FOREBET_TTL_MS = parseInt(process.env.FOREBET_TTL_MIN || '360', 10) * 60 * 1000;   // 6 h on success
+const FOREBET_FAIL_TTL_MS = 15 * 60 * 1000;                                              // 15 min on failure
+
+// Pull rank/team/points/played/W/D/L/GD out of Forebet's #standings <table>.
+// Row shape (verified): std_zn rank, /en/teams/ link name, then centred cells
+// [PTS, GP, W, D, L, +/-]; PTS is wrapped in <b>. GD can be negative.
+function parseForebetStandings(html) {
+  const tbl = html.match(/<table[^>]*id="standings"[^>]*>([\s\S]*?)<\/table>/i);
+  if (!tbl) return null;
+  const rows = tbl[1].match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+  const out = [];
+  for (const row of rows) {
+    if (!/\/en\/teams\//.test(row)) continue;   // skip the header row
+    const rankM = row.match(/std_zn[^>]*>\s*(\d+)/);
+    const nameM = row.match(/\/en\/teams\/[^"]+">\s*([^<]+?)\s*<\/a>/);
+    const nums = [...row.matchAll(/<td[^>]*align="center"[^>]*>(?:\s*<b>)?\s*(-?\d+)\s*(?:<\/b>)?\s*<\/td>/gi)].map(m => parseInt(m[1], 10));
+    if (!nameM || nums.length < 6) continue;
+    out.push({
+      rank: rankM ? parseInt(rankM[1], 10) : out.length + 1,
+      teamName: nameM[1].trim(),
+      points: nums[0], played: nums[1], win: nums[2], draw: nums[3], lose: nums[4], gd: nums[5],
+    });
+  }
+  return out.length ? out : null;
+}
+
+async function fetchForebetStandings(leagueId) {
+  const path = FOREBET_LEAGUES[leagueId];
+  if (!path) return null;                     // only fetch leagues we've mapped
+  const key = String(leagueId);
+  const hit = forebetCache.get(key);
+  if (hit) {
+    const age = Date.now() - hit.at;
+    if (hit.data && age < FOREBET_TTL_MS) return hit.data;        // fresh success
+    if (!hit.data && age < FOREBET_FAIL_TTL_MS) return null;      // recent miss — don't hammer Browserless
+  }
+  if (!BROWSERLESS_TOKEN) return null;
+  const target = `https://www.forebet.com/en/football-tips-and-predictions-for-${path}`;
+  const url = `https://${BROWSERLESS_HOST}/content?token=${encodeURIComponent(BROWSERLESS_TOKEN)}&stealth`;
+  let data = null;
+  try {
+    const { status: code, text } = await httpRequest('POST', url, {
+      body: { url: target, gotoOptions: { waitUntil: 'networkidle2', timeout: 22000 }, waitForSelector: { selector: '#standings', timeout: 15000 } },
+      timeout: 28000,
+    });
+    if (code === 200 && text) data = parseForebetStandings(text);
+    console.log(`[forebet] league ${leagueId} (${path}) → ${data ? data.length + ' rows' : 'no table (HTTP ' + code + ')'}`);
+  } catch (e) {
+    console.warn(`[forebet] league ${leagueId} (${path}) failed: ${e.message}`);
+  }
+  forebetCache.set(key, { at: Date.now(), data });
+  return data;
+}
+
+// Cross-source team-name matcher (api-sports name <-> Forebet name). Normalises
+// accents/punctuation, drops common club words, then matches when every token of
+// the shorter name is present in the longer ("Newcastle" ⊂ "Newcastle United").
+function normTeamName(s) {
+  return String(s || '').toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/&/g, ' and ')
+    .replace(/\b(fc|cf|sc|ac|afc|cd|ud|sd|rc|club|calcio|futbol|football|deportivo|cp|sk|fk|bk|if|ff|the|de)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ').trim();
+}
+function teamNameMatch(a, b) {
+  const na = normTeamName(a), nb = normTeamName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const sa = new Set(na.split(' ').filter(Boolean)), sb = new Set(nb.split(' ').filter(Boolean));
+  const [small, big] = sa.size <= sb.size ? [sa, sb] : [sb, sa];
+  let hit = 0; small.forEach(t => { if (big.has(t)) hit++; });
+  return small.size > 0 && hit === small.size;
+}
+
 // Convert pitchpredictions H2H match row into our standard shape.
 function convertPpH2H(m, requestedHomeName, requestedHomeId) {
   const goalsH = m.ft_goals_home, goalsA = m.ft_goals_away;
@@ -1699,12 +1803,33 @@ app.get('/api/match/:id/details', originGate, async (req, res) => {
     }
   }
 
-  // Standings — reliable JSON API by league_id first, page-scrape as fallback. Both are
-  // the same [[{row}…]] shape, so one trim handles either source.
+  // Standings — CURRENT season from Forebet first (pitch's own table is a season behind).
+  // Forebet has no api-sports IDs, so home/away are matched by name; it also carries no
+  // GF/GA/form, which the table UI doesn't render anyway. Falls back to pitch's JSON API /
+  // page-scrape only when Forebet has no table for this league (unmapped or fetch failed).
+  let forebetRows = null;
+  try { forebetRows = await fetchForebetStandings(m.leagueId); } catch (e) {}
+  if (Array.isArray(forebetRows) && forebetRows.length) {
+    standings = [ forebetRows.map((row) => ({
+      rank: row.rank,
+      teamId: null,
+      teamName: row.teamName,
+      teamLogo: (teamNameMatch(row.teamName, homeName) && m.home && m.home.logo)
+             || (teamNameMatch(row.teamName, awayName) && m.away && m.away.logo) || '',
+      group: '',
+      played: row.played, win: row.win, draw: row.draw, lose: row.lose,
+      gf: null, ga: null, gd: row.gd, points: row.points,
+      form: '', description: '',
+      isHomeTeam: teamNameMatch(row.teamName, homeName),
+      isAwayTeam: teamNameMatch(row.teamName, awayName),
+    })) ];
+  }
   let rawStandings = null;
-  try { rawStandings = await fetchLeagueStandings(m.leagueId); } catch (e) {}
-  if (!Array.isArray(rawStandings) || !rawStandings.length) rawStandings = extStandings;
-  if (Array.isArray(rawStandings) && rawStandings.length) {
+  if (!standings) {
+    try { rawStandings = await fetchLeagueStandings(m.leagueId); } catch (e) {}
+    if (!Array.isArray(rawStandings) || !rawStandings.length) rawStandings = extStandings;
+  }
+  if (!standings && Array.isArray(rawStandings) && rawStandings.length) {
     standings = rawStandings.map((group) =>
       (Array.isArray(group) ? group : []).map((row) => ({
         rank: row.rank,
