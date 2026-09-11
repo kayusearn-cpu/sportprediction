@@ -53,6 +53,7 @@ const cors = require('cors');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
@@ -188,6 +189,109 @@ function saveCache() {
 
 function matchKey(home, away) {
   return `${(home || '').trim().toLowerCase()}|${(away || '').trim().toLowerCase()}`;
+}
+
+// ============================================================================
+// Community comments — per-match chat. Anyone can READ; posting needs a signed-in
+// account. Fully self-contained on this backend + the persistent volume (no
+// external service). Moderation is SERVER-side so it can't be bypassed: links /
+// channel promos are rejected, a profanity filter can be toggled by the admin,
+// and the admin can ban a user. Stored SEPARATELY from the match cache (its own
+// file) so a scrape rebuild can never touch user accounts or comments.
+// ============================================================================
+const COMMUNITY_FILE = path.join(path.dirname(CACHE_FILE), 'community.json');
+let activeCommunityPath = COMMUNITY_FILE;
+// users:{ key:{username,salt,hash,at} }  comments:{ matchId:[{id,user,text,at,edited}] }
+// banned:{ key:true }                    settings:{ filterEnabled }
+const community = { users: {}, comments: {}, banned: {}, settings: { filterEnabled: true }, secret: '' };
+
+function _writeCommunity() {
+  try { fs.mkdirSync(path.dirname(activeCommunityPath), { recursive: true }); } catch (e) {}
+  try { fs.writeFileSync(activeCommunityPath, JSON.stringify(community)); return; }
+  catch (e) {
+    if (activeCommunityPath !== '/tmp/community.json') {
+      console.error(`[community] ${activeCommunityPath} unwritable (${e.message}); using /tmp.`);
+      activeCommunityPath = '/tmp/community.json';
+      try { fs.writeFileSync(activeCommunityPath, JSON.stringify(community)); return; } catch (e2) {}
+    }
+    console.error('[community] save failed:', e.message);
+  }
+}
+let _communityDirty = false;
+function saveCommunity() { _communityDirty = true; }           // coalesce bursts during live matches
+setInterval(() => { if (_communityDirty) { _communityDirty = false; _writeCommunity(); } }, 2000).unref();
+
+function loadCommunity() {
+  const candidates = [COMMUNITY_FILE];
+  if (COMMUNITY_FILE !== '/tmp/community.json') candidates.push('/tmp/community.json');
+  for (const p of candidates) {
+    try {
+      const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+      community.users = j.users || {};
+      community.comments = j.comments || {};
+      community.banned = j.banned || {};
+      community.settings = j.settings || { filterEnabled: true };
+      community.secret = j.secret || '';
+      const nc = Object.values(community.comments).reduce((n, a) => n + (a ? a.length : 0), 0);
+      console.log(`[community] loaded ${Object.keys(community.users).length} user(s), ${nc} comment(s) from ${p}`);
+      break;
+    } catch (e) { /* try next candidate */ }
+  }
+  if (!community.secret) { community.secret = crypto.randomBytes(32).toString('hex'); _writeCommunity(); }
+}
+
+// The admin is one username (set ADMIN_USER in Railway). Only that account sees the
+// ban button and can delete anyone's comment or toggle the profanity filter.
+const ADMIN_USER = (process.env.ADMIN_USER || '').trim().toLowerCase();
+function isAdminUser(key) { return !!key && !!ADMIN_USER && key === ADMIN_USER; }
+
+function _safeEq(a, b) {
+  const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+function hashPw(pw, salt) { return crypto.scryptSync(String(pw), salt, 64).toString('hex'); }
+function makeToken(key) {
+  const body = `${key}.${Date.now() + 30 * 24 * 3600 * 1000}`;   // 30-day token
+  const sig = crypto.createHmac('sha256', community.secret).update(body).digest('hex').slice(0, 32);
+  return `${Buffer.from(body).toString('base64url')}.${sig}`;
+}
+function userFromToken(token) {
+  try {
+    const [b64, sig] = String(token || '').split('.');
+    if (!b64 || !sig) return null;
+    const body = Buffer.from(b64, 'base64url').toString();
+    const expect = crypto.createHmac('sha256', community.secret).update(body).digest('hex').slice(0, 32);
+    if (!_safeEq(sig, expect)) return null;
+    const dot = body.lastIndexOf('.');
+    const key = body.slice(0, dot), exp = parseInt(body.slice(dot + 1), 10);
+    if (!key || !exp || Date.now() > exp) return null;
+    if (!community.users[key] || community.banned[key]) return null;
+    return key;
+  } catch (e) { return null; }
+}
+function authKey(req) {
+  const h = req.headers.authorization || '';
+  const t = h.startsWith('Bearer ') ? h.slice(7) : (req.body && req.body.token) || '';
+  return userFromToken(t);
+}
+
+// Moderation. Links / channel promos are NEVER allowed (the whole point — kills the
+// "join my channel" spam in the screenshot). Profanity is a separate, admin-toggle
+// filter. Both run server-side, so a user editing the page can't get around them.
+const LINK_RE = /(https?:\/\/|www\.|t\.me\/|wa\.me\/|chat\.whatsapp|\bbit\.ly\b|@[a-z0-9_]{3,}|\b[a-z0-9][a-z0-9-]*\.(com|net|org|io|xyz|ng|co|me|link|live|vip|bet|tv|app|site|online|club|info|biz|shop|store)\b)/i;
+const BAD_WORDS = (process.env.BAD_WORDS ||
+  'fuck,fucker,fucking,fuckin,shit,bitch,bastard,asshole,ass,dick,pussy,cunt,nigger,nigga,faggot,slut,whore,motherfucker,retard,idiot,stupid,fool,foolish,rubbish,nonsense,scam,scammer,fraud,ashewo,ole,mumu,olodo,werey,mad,madman')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+function hasLink(text) { return LINK_RE.test(text); }
+function hasProfanity(text) {
+  const t = ' ' + String(text).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim() + ' ';
+  return BAD_WORDS.some(w => t.includes(' ' + w + ' '));
+}
+const _lastPost = {};   // key -> ts, for a light per-user rate limit
+const USER_RE = /^[a-zA-Z0-9_]{3,20}$/;
+function trimComment(c, viewerKey, admin) {
+  return { id: c.id, user: c.user, text: c.text, at: c.at, edited: !!c.edited,
+    mine: !!viewerKey && c.user.toLowerCase() === viewerKey, canModerate: !!admin };
 }
 
 // Minimal promise wrapper around https. Returns { status, text }.
@@ -1888,12 +1992,129 @@ app.get('/api/match/:id/details', originGate, async (req, res) => {
   });
 });
 
+// ============================ Community routes ==============================
+// Auth: sign up / sign in. Passwords are scrypt-hashed; we return a signed 30-day
+// token the frontend stores in localStorage and sends as `Authorization: Bearer`.
+app.post('/api/auth/signup', originGate, (req, res) => {
+  const username = String((req.body && req.body.username) || '').trim();
+  const password = String((req.body && req.body.password) || '');
+  if (!USER_RE.test(username)) return res.status(400).json({ error: 'Username must be 3–20 letters, numbers or _.' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  if (hasLink(username) || hasProfanity(username)) return res.status(400).json({ error: 'Please choose a different username.' });
+  const key = username.toLowerCase();
+  if (community.users[key]) return res.status(409).json({ error: 'That username is taken.' });
+  const salt = crypto.randomBytes(16).toString('hex');
+  community.users[key] = { username, salt, hash: hashPw(password, salt), at: Date.now() };
+  saveCommunity();
+  res.json({ token: makeToken(key), username, isAdmin: isAdminUser(key) });
+});
+app.post('/api/auth/login', originGate, (req, res) => {
+  const key = String((req.body && req.body.username) || '').trim().toLowerCase();
+  const password = String((req.body && req.body.password) || '');
+  const u = community.users[key];
+  if (!u || !_safeEq(u.hash, hashPw(password, u.salt))) return res.status(401).json({ error: 'Wrong username or password.' });
+  if (community.banned[key]) return res.status(403).json({ error: 'This account has been banned.' });
+  res.json({ token: makeToken(key), username: u.username, isAdmin: isAdminUser(key) });
+});
+app.get('/api/auth/me', (req, res) => {
+  const key = authKey(req);
+  if (!key) return res.status(401).json({ error: 'not signed in' });
+  res.json({ username: community.users[key].username, isAdmin: isAdminUser(key), filterEnabled: !!community.settings.filterEnabled });
+});
+
+// Comments — READ is public, WRITE needs a token. Banned users are hidden + blocked.
+app.get('/api/matches/:id/comments', originGate, (req, res) => {
+  const id = String(req.params.id || '').slice(0, 200);
+  const key = authKey(req);
+  const admin = isAdminUser(key);
+  const list = (community.comments[id] || []).filter(c => !community.banned[c.user.toLowerCase()]);
+  res.json({
+    comments: list.slice(-200).map(c => trimComment(c, key, admin)),
+    canComment: !!key, isAdmin: admin, filterEnabled: !!community.settings.filterEnabled,
+  });
+});
+app.post('/api/matches/:id/comments', originGate, (req, res) => {
+  const key = authKey(req);
+  if (!key) return res.status(401).json({ error: 'Sign in to comment.' });
+  if (community.banned[key]) return res.status(403).json({ error: 'You are banned from commenting.' });
+  const id = String(req.params.id || '').slice(0, 200);
+  if (!store.matches[id]) return res.status(404).json({ error: 'Match not found.' });
+  let text = String((req.body && req.body.text) || '').replace(/\s+/g, ' ').trim();
+  if (!text) return res.status(400).json({ error: 'Type a message first.' });
+  if (text.length > 300) text = text.slice(0, 300);
+  if (hasLink(text)) return res.status(400).json({ error: 'Links and channel promotions are not allowed.' });
+  if (community.settings.filterEnabled && hasProfanity(text)) return res.status(400).json({ error: 'Please keep it respectful — that message was blocked.' });
+  const now = Date.now();
+  if (_lastPost[key] && now - _lastPost[key] < 4000) return res.status(429).json({ error: 'You are commenting too fast — wait a moment.' });
+  _lastPost[key] = now;
+  const c = { id: crypto.randomBytes(8).toString('hex'), user: community.users[key].username, text, at: now, edited: false };
+  (community.comments[id] = community.comments[id] || []).push(c);
+  if (community.comments[id].length > 500) community.comments[id] = community.comments[id].slice(-500);
+  saveCommunity();
+  res.json({ comment: trimComment(c, key, isAdminUser(key)) });
+});
+app.patch('/api/matches/:id/comments/:cid', originGate, (req, res) => {
+  const key = authKey(req);
+  if (!key) return res.status(401).json({ error: 'Sign in first.' });
+  const list = community.comments[String(req.params.id || '').slice(0, 200)] || [];
+  const c = list.find(x => x.id === req.params.cid);
+  if (!c) return res.status(404).json({ error: 'Comment not found.' });
+  if (c.user.toLowerCase() !== key) return res.status(403).json({ error: 'You can only edit your own comment.' });
+  let text = String((req.body && req.body.text) || '').replace(/\s+/g, ' ').trim();
+  if (!text) return res.status(400).json({ error: 'Type a message first.' });
+  if (text.length > 300) text = text.slice(0, 300);
+  if (hasLink(text)) return res.status(400).json({ error: 'Links and channel promotions are not allowed.' });
+  if (community.settings.filterEnabled && hasProfanity(text)) return res.status(400).json({ error: 'Please keep it respectful — that message was blocked.' });
+  c.text = text; c.edited = true;
+  saveCommunity();
+  res.json({ comment: trimComment(c, key, isAdminUser(key)) });
+});
+app.delete('/api/matches/:id/comments/:cid', originGate, (req, res) => {
+  const key = authKey(req);
+  if (!key) return res.status(401).json({ error: 'Sign in first.' });
+  const list = community.comments[String(req.params.id || '').slice(0, 200)] || [];
+  const i = list.findIndex(x => x.id === req.params.cid);
+  if (i < 0) return res.status(404).json({ error: 'Comment not found.' });
+  if (list[i].user.toLowerCase() !== key && !isAdminUser(key)) return res.status(403).json({ error: 'Not allowed.' });
+  list.splice(i, 1);
+  saveCommunity();
+  res.json({ ok: true });
+});
+
+// Admin only — ban / unban a user, toggle the profanity filter.
+app.post('/api/admin/ban', originGate, (req, res) => {
+  const key = authKey(req);
+  if (!isAdminUser(key)) return res.status(403).json({ error: 'Admin only.' });
+  const target = String((req.body && req.body.username) || '').trim().toLowerCase();
+  if (!target || target === ADMIN_USER) return res.status(400).json({ error: 'Invalid target.' });
+  community.banned[target] = true;
+  saveCommunity();
+  res.json({ ok: true, banned: target });
+});
+app.post('/api/admin/unban', originGate, (req, res) => {
+  const key = authKey(req);
+  if (!isAdminUser(key)) return res.status(403).json({ error: 'Admin only.' });
+  const target = String((req.body && req.body.username) || '').trim().toLowerCase();
+  delete community.banned[target];
+  saveCommunity();
+  res.json({ ok: true, unbanned: target });
+});
+app.post('/api/admin/filter', originGate, (req, res) => {
+  const key = authKey(req);
+  if (!isAdminUser(key)) return res.status(403).json({ error: 'Admin only.' });
+  community.settings.filterEnabled = !!(req.body && req.body.enabled);
+  saveCommunity();
+  res.json({ ok: true, filterEnabled: community.settings.filterEnabled });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`⚽ Prediction scraper live on :${PORT}`);
   console.log(`   cadence: live=${LIVE_REFRESH_MIN}min  future=${FUTURE_REFRESH_MIN}min  past=${PAST_REFRESH_MIN}min`);
   console.log(`   primary: ${ENABLE_PRIMARY ? 'ENABLED (' + TARGET_URL + ')' : 'disabled'}`);
   console.log(`   fallback=${FALLBACK_URL}  browserless=${BROWSERLESS_HOST}`);
   loadCache();
+  loadCommunity();
+  console.log(`   community: comments ON  admin=${ADMIN_USER || '(unset — set ADMIN_USER to enable ban/moderation)'}`);
   startTieredScheduler();
   if (TG_TOKEN) pollTelegram();
 });
