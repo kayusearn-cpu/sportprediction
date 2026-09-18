@@ -1994,6 +1994,84 @@ app.get('/api/match/:id/details', originGate, async (req, res) => {
   });
 });
 
+// ============================ Sports news ===================================
+// We show a SHORT summary on our own site (users read it here, no redirect). To do
+// that legally we use only publishers whose RSS feeds PUBLISH short summaries FOR
+// syndication — BBC Sport & The Guardian football. We show their headline + their
+// own 1-2 sentence summary + a small credit link. We never host the full article
+// (that would be copyright infringement — the very thing that got the DMCA). The
+// four sites the user first named (Daily Mail/Telegraph/Bleacher/Athletic) block
+// this (paywalls / no summary feed), so they can't be shown on-site.
+const NEWS_SOURCES = [
+  { label: 'BBC Sport',    url: 'https://feeds.bbci.co.uk/sport/football/rss.xml' },
+  { label: 'The Guardian', url: 'https://www.theguardian.com/football/rss' },
+];
+const NEWS_MAX        = parseInt(process.env.NEWS_MAX || '12', 10);
+const NEWS_PER_SOURCE = parseInt(process.env.NEWS_PER_SOURCE || '6', 10);
+const NEWS_TTL_MS     = parseInt(process.env.NEWS_TTL_MIN || '180', 10) * 60 * 1000;   // refresh ~every 3h
+let newsCache = { at: 0, items: [] };
+
+function _cleanText(s) {
+  return String(s)
+    .replace(/<!\[CDATA\[|\]\]>/g, '')
+    .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')       // decode escaped tags FIRST
+    .replace(/<[^>]+>/g, ' ')                            // then strip ALL tags (real + decoded)
+    .replace(/&nbsp;/gi, ' ').replace(/&quot;/gi, '"')
+    .replace(/&#8217;|&rsquo;|&#0?39;|&apos;|&#8216;|&lsquo;/gi, "'")
+    .replace(/&#8211;|&ndash;|&#8212;|&mdash;/gi, '–').replace(/&#8230;|&hellip;/gi, '…')
+    .replace(/&amp;/gi, '&')                             // decode &amp; LAST
+    .replace(/\s*Continue reading\.{0,3}\s*$/i, '')      // Guardian trailing cruft
+    .replace(/\s+/g, ' ').trim();
+}
+function parseRss(xml, label) {
+  const out = [];
+  for (const m of String(xml).matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+    const b = m[1];
+    const grab = (t) => { const r = b.match(new RegExp('<' + t + '[^>]*>([\\s\\S]*?)</' + t + '>')); return r ? r[1] : ''; };
+    const title = _cleanText(grab('title'));
+    let summary = _cleanText(grab('description'));
+    if (summary.length > 220) summary = summary.slice(0, 217).replace(/\s+\S*$/, '') + '…';   // keep it short
+    const link = _cleanText(grab('link'));
+    const pubDate = grab('pubDate').trim();
+    const im = b.match(/<media:(?:thumbnail|content)[^>]*\surl="([^"]+)"/i) || b.match(/<enclosure[^>]*\surl="([^"]+)"/i);
+    if (!title) continue;
+    out.push({ title, summary, link, source: label, image: im ? im[1] : '', publishedAt: pubDate ? new Date(pubDate).toISOString() : null });
+  }
+  return out;
+}
+
+async function fetchNews() {
+  const collected = [];
+  for (const s of NEWS_SOURCES) {
+    try {
+      const { status, text } = await httpRequest('GET', s.url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'Accept': 'application/rss+xml, application/xml, text/xml' },
+        maxRedirects: 3,
+      });
+      if (status === 200 && text) collected.push(...parseRss(text, s.label).slice(0, NEWS_PER_SOURCE));
+    } catch (e) { /* skip this source */ }
+  }
+  // Google News' "soccer" tag on US sites is loose (it pulled a WWE popcorn story),
+  // so drop anything that's clearly another sport — this is a football/soccer feed.
+  const NOT_SOCCER = /\b(nfl|nba|mlb|nhl|wnba|wwe|ufc|mma|wrestl|boxing|nascar|formula\s?1|\bf1\b|super\s?bowl|touchdown|quarterback|popcorn|golf|tennis|cricket|rugby|olympics)\b/i;
+  const seen = new Set();
+  const items = collected
+    .filter(i => {
+      if (NOT_SOCCER.test(i.title)) return false;
+      const k = i.title.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true;
+    })
+    .sort((a, b) => (b.publishedAt || '').localeCompare(a.publishedAt || ''))
+    .slice(0, NEWS_MAX);
+  if (items.length) newsCache = { at: Date.now(), items };   // keep last good set if a refresh comes back empty
+  console.log(`[news] refreshed ${items.length} headline(s)`);
+  return newsCache.items;
+}
+
+app.get('/api/news', originGate, (req, res) => {
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json({ items: newsCache.items, updatedAt: newsCache.at ? new Date(newsCache.at).toISOString() : null });
+});
+
 // ============================ Community routes ==============================
 // Auth: sign up / sign in. Passwords are scrypt-hashed; we return a signed 30-day
 // token the frontend stores in localStorage and sends as `Authorization: Bearer`.
@@ -2128,6 +2206,8 @@ app.listen(PORT, '0.0.0.0', () => {
   loadCache();
   loadCommunity();
   console.log(`   community: comments ON  admin=${ADMIN_USER || '(unset — set ADMIN_USER to enable ban/moderation)'}`);
+  fetchNews().catch(() => {});                                   // sports-news headlines
+  setInterval(() => fetchNews().catch(() => {}), NEWS_TTL_MS).unref();
   startTieredScheduler();
   if (TG_TOKEN) pollTelegram();
 });
