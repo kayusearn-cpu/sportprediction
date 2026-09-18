@@ -288,6 +288,7 @@ function hasProfanity(text) {
   return BAD_WORDS.some(w => t.includes(' ' + w + ' '));
 }
 const _lastPost = {};   // key -> ts, for a light per-user rate limit
+let _cmtNotifyTimes = [];   // recent admin-notify timestamps (flood guard for Telegram)
 const USER_RE = /^[a-zA-Z0-9_]{3,20}$/;
 function trimComment(c, viewerKey, admin) {
   return { id: c.id, user: c.user, text: c.text, at: c.at, edited: !!c.edited,
@@ -1982,6 +1983,7 @@ app.get('/api/match/:id/details', originGate, async (req, res) => {
       recommendation: m.recommendation || '',
     },
     standings,
+    commentCount: (community.comments[id] || []).filter(c => !community.banned[c.user.toLowerCase()]).length,
     historyDays: parseInt(process.env.HISTORY_DAYS || '60', 10),
     cacheStats: { totalMatches: Object.keys(store.matches).length, totalFinished },
     externalSource,
@@ -2051,6 +2053,17 @@ app.post('/api/matches/:id/comments', originGate, (req, res) => {
   (community.comments[id] = community.comments[id] || []).push(c);
   if (community.comments[id].length > 500) community.comments[id] = community.comments[id].slice(-500);
   saveCommunity();
+  // Notify the admin on Telegram for every new comment — throttled to <=20/min so a
+  // busy match can't flood the chat or trigger a Telegram flood-ban.
+  if (TG_TOKEN && ADMIN_ID) {
+    _cmtNotifyTimes = _cmtNotifyTimes.filter(t => now - t < 60000);
+    if (_cmtNotifyTimes.length < 20) {
+      _cmtNotifyTimes.push(now);
+      const mm = store.matches[id];
+      const label = mm ? `${mm.home && mm.home.name} v ${mm.away && mm.away.name}` : id;
+      tgSend(ADMIN_ID, `💬 New comment — ${label}\n${c.user}: ${text.slice(0, 160)}`);
+    }
+  }
   res.json({ comment: trimComment(c, key, isAdminUser(key)) });
 });
 app.patch('/api/matches/:id/comments/:cid', originGate, (req, res) => {
