@@ -75,6 +75,9 @@ const ONLY_WITH_ODDS = (process.env.ONLY_WITH_ODDS || 'true').toLowerCase() !== 
 const ENABLE_PRIMARY = (process.env.ENABLE_PRIMARY || 'false').toLowerCase() === 'true';
 
 const BROWSERLESS_HOST = process.env.BROWSERLESS_HOST || 'chrome.browserless.io';
+// Forebet's Cloudflare now defeats /content?stealth, so Forebet is fetched via Browserless's
+// dedicated anti-bot /unblock endpoint (slower but gets through). Lives on the v2 host.
+const BROWSERLESS_UNBLOCK_HOST = process.env.BROWSERLESS_UNBLOCK_HOST || 'production-sfo.browserless.io';
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '';
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
@@ -289,6 +292,10 @@ function hasProfanity(text) {
 }
 const _lastPost = {};   // key -> ts, for a light per-user rate limit
 let _cmtNotifyTimes = [];   // recent admin-notify timestamps (flood guard for Telegram)
+let _lastScrapeErrAlert = 0;   // throttle scrape-failure Telegram alerts (they flood the chat during an upstream outage and bury real comment notifications)
+const SCRAPE_ERR_ALERT_MS = parseInt(process.env.SCRAPE_ERR_ALERT_MIN || '30', 10) * 60 * 1000;
+let _lastForebetFallback = 0;  // throttle the Forebet fixtures fallback (only runs while pitch is failing)
+const FOREBET_FALLBACK_MS = parseInt(process.env.FOREBET_FALLBACK_MIN || '5', 10) * 60 * 1000;
 const USER_RE = /^[a-zA-Z0-9_]{3,20}$/;
 function trimComment(c, viewerKey, admin) {
   return { id: c.id, user: c.user, text: c.text, at: c.at, edited: !!c.edited,
@@ -1164,9 +1171,22 @@ async function scrapeOne(src, trigger = 'scheduler') {
     status.lastError = `${src.name}: ${err.message}`;
     status.lastRun = new Date().toISOString();
     console.error(`[scrape ${src.name}] error:`, err.message);
-    // Don't spam Telegram for low-priority (past/primary) failures.
-    if (TG_TOKEN && ADMIN_ID && (src.tier === 'live' || src.tier === 'future')) {
-      tgSend(ADMIN_ID, `❌ Scrape (${src.name}) failed: ${err.message}`);
+    // Throttle scrape-failure alerts to one every SCRAPE_ERR_ALERT_MIN — otherwise an
+    // upstream outage DMs the admin dozens of "failed" messages and buries real comment
+    // notifications (the user's complaint). One heads-up is enough; the rest are muted.
+    if (TG_TOKEN && ADMIN_ID && (src.tier === 'live' || src.tier === 'future') && Date.now() - _lastScrapeErrAlert > SCRAPE_ERR_ALERT_MS) {
+      _lastScrapeErrAlert = Date.now();
+      tgSend(ADMIN_ID, `⚠️ Scraper trouble (${src.name}: ${err.message}). Muting further scrape errors for ${SCRAPE_ERR_ALERT_MS / 60000} min.`);
+    }
+    // Forebet fallback: when the fast/free TODAY slate or live-games source fails (pitch
+    // down), backfill today's matches from Forebet so the site keeps fresh data. Throttled,
+    // so Browserless units are only spent during an actual outage.
+    if ((src.kind === 'live' || (src.kind === 'api' && src.apiOffset === 0)) && Date.now() - _lastForebetFallback > FOREBET_FALLBACK_MS) {
+      _lastForebetFallback = Date.now();
+      try {
+        const fb = await fetchForebetFixtures();
+        if (fb && fb.length) { const n = mergeIntoCache(fb); saveCache(); console.log(`[forebet-fallback] merged ${n} match(es) while pitch ${src.name} was down`); }
+      } catch (e) { console.warn('[forebet-fallback] failed:', e.message); }
     }
     return { error: err.message };
   } finally {
@@ -1716,6 +1736,20 @@ const FOREBET_FAIL_TTL_MS = 15 * 60 * 1000;                                     
 // Pull rank/team/points/played/W/D/L/GD out of Forebet's #standings <table>.
 // Row shape (verified): std_zn rank, /en/teams/ link name, then centred cells
 // [PTS, GP, W, D, L, +/-]; PTS is wrapped in <b>. GD can be negative.
+// Fetch a Cloudflare-protected Forebet page via Browserless /unblock (returns the final
+// rendered HTML after the anti-bot challenge is solved). Slower than /content but it's the
+// only method that still gets through Forebet's Cloudflare.
+async function fetchForebetUnblock(targetUrl) {
+  if (!BROWSERLESS_TOKEN) return '';
+  const url = `https://${BROWSERLESS_UNBLOCK_HOST}/unblock?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+  const { status, text } = await httpRequest('POST', url, {
+    body: { url: targetUrl, content: true, cookies: false, screenshot: false, ttl: 30000 },
+    timeout: 55000,
+  });
+  if (status !== 200 || !text) throw new Error(`unblock HTTP ${status}: ${String(text).slice(0, 100)}`);
+  try { return JSON.parse(text).content || ''; } catch (e) { return text; }
+}
+
 function parseForebetStandings(html) {
   const tbl = html.match(/<table[^>]*id="standings"[^>]*>([\s\S]*?)<\/table>/i);
   if (!tbl) return null;
@@ -1748,20 +1782,84 @@ async function fetchForebetStandings(leagueId) {
   }
   if (!BROWSERLESS_TOKEN) return null;
   const target = `https://www.forebet.com/en/football-tips-and-predictions-for-${path}`;
-  const url = `https://${BROWSERLESS_HOST}/content?token=${encodeURIComponent(BROWSERLESS_TOKEN)}&stealth`;
   let data = null;
   try {
-    const { status: code, text } = await httpRequest('POST', url, {
-      body: { url: target, gotoOptions: { waitUntil: 'networkidle2', timeout: 22000 }, waitForSelector: { selector: '#standings', timeout: 15000 } },
-      timeout: 28000,
-    });
-    if (code === 200 && text) data = parseForebetStandings(text);
-    console.log(`[forebet] league ${leagueId} (${path}) → ${data ? data.length + ' rows' : 'no table (HTTP ' + code + ')'}`);
+    const html = await fetchForebetUnblock(target);
+    if (html) data = parseForebetStandings(html);
+    console.log(`[forebet] league ${leagueId} (${path}) → ${data ? data.length + ' rows' : 'no table'}`);
   } catch (e) {
     console.warn(`[forebet] league ${leagueId} (${path}) failed: ${e.message}`);
   }
   forebetCache.set(key, { at: Date.now(), data });
   return data;
+}
+
+// ---- Forebet FIXTURES fallback ---------------------------------------------
+// When pitch (our fast/free JSON source) is down, we backfill TODAY's slate by
+// scraping Forebet's "today" predictions page (fixtures + 1X2 % + predicted score
+// + live/FT scores). Each match row is a <div class="rcnt"> with schema.org markup.
+function parseForebetFixtures(html) {
+  const rows = String(html).split('<div class="rcnt').slice(1);
+  const out = [];
+  for (const row of rows) {
+    const nameMeta = (row.match(/itemprop="name" content="([^"]+?) vs ([^"]+?)"/) || []);
+    let home = (row.match(/homeTeam"[^>]*>\s*<span[^>]*>([^<]+)</) || [])[1] || nameMeta[1];
+    let away = (row.match(/awayTeam"[^>]*>\s*<span[^>]*>([^<]+)</) || [])[1] || nameMeta[2];
+    if (!home || !away) continue;
+    const dISO = (row.match(/<time datetime="([^"]+)"/) || [])[1] || '';
+    const tM = row.match(/date_bah[^>]*>\s*\d{1,2}\/\d{1,2}\/\d{4}\s+(\d{1,2}):(\d{2})/);
+    const time = tM ? `${tM[1].padStart(2, '0')}:${tM[2]}` : '';
+    const pr = row.match(/fprc"[^>]*>\s*<span[^>]*>(\d+)<\/span>\s*<span[^>]*>(\d+)<\/span>\s*<span[^>]*>(\d+)<\/span>/);
+    const pick = (row.match(/forepr"[^>]*>\s*<span[^>]*>([^<]+)</) || [])[1] || '';
+    const predScore = ((row.match(/ex_sc tabonly">([^<]+)</) || [])[1] || '').replace(/\s/g, '');
+    const scoreM = row.match(/l_scr">\s*(\d+)\s*-\s*(\d+)/);
+    const stag = row.match(/getstag\(this,\d+,'([^']*)','([^']*)'/);
+    const lminTd = (row.match(/class="lmin_td[^"]*"[^>]*>([\s\S]*?)<div class="lscr_td/) || [])[1] || '';
+    const lmin = lminTd.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    let status = 'NS', elapsed = null;
+    if (scoreM) {
+      if (/^(FT|AET|Pen|PEN)/i.test(lmin)) { status = 'FT'; elapsed = 90; }
+      else if (/HT/i.test(lmin)) { status = 'LIVE'; elapsed = 45; }
+      else { status = 'LIVE'; const em = lmin.match(/(\d{1,3})/); elapsed = em ? parseInt(em[1], 10) : 1; }
+    }
+    out.push({
+      home: _cleanText(home), away: _cleanText(away), dISO, time,
+      probs: pr ? [parseInt(pr[1], 10), parseInt(pr[2], 10), parseInt(pr[3], 10)] : null,
+      pick, predScore, scoreStr: scoreM ? `${scoreM[1]}-${scoreM[2]}` : '',
+      status, elapsed,
+      country: stag ? _cleanText(stag[1]) : '', league: stag ? _cleanText(stag[2]) : '',
+    });
+  }
+  return out;
+}
+
+// Map a parsed Forebet fixture into the same shape mergeIntoCache() expects from pitch.
+function forebetFixtureToP(m) {
+  const h = m.probs ? m.probs[0] : 0, d = m.probs ? m.probs[1] : 0, a = m.probs ? m.probs[2] : 0;
+  return {
+    homeTeam: m.home, awayTeam: m.away, date: m.dISO || new Date().toISOString().slice(0, 10), time: m.time,
+    score: m.scoreStr, status: m.status,
+    statusRaw: m.status === 'LIVE' ? String(m.elapsed || '') : m.status,
+    elapsed: m.status === 'LIVE' ? (m.elapsed || null) : (m.status === 'FT' ? 90 : null),
+    league: m.league, country: m.country, leagueId: null,
+    homeLogo: '', awayLogo: '', leagueLogo: '', countryFlag: '',
+    prediction: m.pick || '', correctScore: m.predScore || '',
+    probHome: h, probDraw: d, probAway: a, hasOdds: (h + d + a) > 0,
+    fixtureId: null, recommendation: '', source: 'forebet',
+  };
+}
+
+let _forebetFixturesCache = { at: 0, data: [] };
+async function fetchForebetFixtures() {
+  if (!BROWSERLESS_TOKEN) return [];
+  if (_forebetFixturesCache.data.length && Date.now() - _forebetFixturesCache.at < FOREBET_FALLBACK_MS) return _forebetFixturesCache.data;
+  const target = 'https://www.forebet.com/en/football-tips-and-predictions-for-today';
+  const html = await fetchForebetUnblock(target);
+  if (!html) throw new Error('unblock returned empty');
+  const parsed = parseForebetFixtures(html).map(forebetFixtureToP).filter(p => p.homeTeam && p.awayTeam);
+  _forebetFixturesCache = { at: Date.now(), data: parsed };
+  console.log(`[forebet-fallback] parsed ${parsed.length} fixtures from Forebet`);
+  return parsed;
 }
 
 // Cross-source team-name matcher (api-sports name <-> Forebet name). Normalises
