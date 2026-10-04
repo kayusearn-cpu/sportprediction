@@ -1743,8 +1743,8 @@ async function fetchForebetUnblock(targetUrl) {
   if (!BROWSERLESS_TOKEN) return '';
   const url = `https://${BROWSERLESS_UNBLOCK_HOST}/unblock?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
   const { status, text } = await httpRequest('POST', url, {
-    body: { url: targetUrl, content: true, cookies: false, screenshot: false, ttl: 30000 },
-    timeout: 55000,
+    body: { url: targetUrl, content: true, cookies: false, screenshot: false, ttl: 45000 },
+    timeout: 75000,
   });
   if (status !== 200 || !text) throw new Error(`unblock HTTP ${status}: ${String(text).slice(0, 100)}`);
   try { return JSON.parse(text).content || ''; } catch (e) { return text; }
@@ -1770,6 +1770,12 @@ function parseForebetStandings(html) {
   return out.length ? out : null;
 }
 
+// Cache-only read — never triggers the slow /unblock fetch. Safe to call in a user request.
+function getForebetStandingsCached(leagueId) {
+  const hit = forebetCache.get(String(leagueId));
+  return (hit && hit.data && Date.now() - hit.at < FOREBET_TTL_MS) ? hit.data : null;
+}
+const _forebetInflight = new Set();
 async function fetchForebetStandings(leagueId) {
   const path = FOREBET_LEAGUES[leagueId];
   if (!path) return null;                     // only fetch leagues we've mapped
@@ -1780,7 +1786,8 @@ async function fetchForebetStandings(leagueId) {
     if (hit.data && age < FOREBET_TTL_MS) return hit.data;        // fresh success
     if (!hit.data && age < FOREBET_FAIL_TTL_MS) return null;      // recent miss — don't hammer Browserless
   }
-  if (!BROWSERLESS_TOKEN) return null;
+  if (!BROWSERLESS_TOKEN || _forebetInflight.has(key)) return hit && hit.data ? hit.data : null;
+  _forebetInflight.add(key);                  // avoid duplicate /unblock calls for the same league
   const target = `https://www.forebet.com/en/football-tips-and-predictions-for-${path}`;
   let data = null;
   try {
@@ -1789,6 +1796,8 @@ async function fetchForebetStandings(leagueId) {
     console.log(`[forebet] league ${leagueId} (${path}) → ${data ? data.length + ' rows' : 'no table'}`);
   } catch (e) {
     console.warn(`[forebet] league ${leagueId} (${path}) failed: ${e.message}`);
+  } finally {
+    _forebetInflight.delete(key);
   }
   forebetCache.set(key, { at: Date.now(), data });
   return data;
@@ -2010,8 +2019,11 @@ app.get('/api/match/:id/details', originGate, async (req, res) => {
   // Forebet has no api-sports IDs, so home/away are matched by name; it also carries no
   // GF/GA/form, which the table UI doesn't render anyway. Falls back to pitch's JSON API /
   // page-scrape only when Forebet has no table for this league (unmapped or fetch failed).
-  let forebetRows = null;
-  try { forebetRows = await fetchForebetStandings(m.leagueId); } catch (e) {}
+  // Read Forebet standings from CACHE ONLY — the /unblock fetch is 12-55s, far too slow to
+  // block a detail request on. On a miss, kick off a background refresh (so the next open of
+  // this league is current) and use pitch's table for now.
+  let forebetRows = getForebetStandingsCached(m.leagueId);
+  if (!forebetRows && FOREBET_LEAGUES[m.leagueId]) { fetchForebetStandings(m.leagueId).catch(() => {}); }
   if (Array.isArray(forebetRows) && forebetRows.length) {
     standings = [ forebetRows.map((row) => ({
       rank: row.rank,
