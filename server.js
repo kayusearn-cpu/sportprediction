@@ -1,245 +1,215 @@
 
- // ===== MAGICBETTINGTIPS LIVE-SCORE REPAIR =====
- // Paste ONCE at the very bottom of your existing scraper JS file.
- // Required Railway variable: API_FOOTBALL_KEY=your_api_football_key
- // Optional: API_FOOTBALL_LIVE_MIN=15
+ // === INDEPENDENT LIVE-SCORES BACKUP ===
+ // Uses the FOOTBALL_DATA_API_KEY configured in Railway.
 
+ const LIVE_BACKUP_KEY = (
+   process.env.FOOTBALL_DATA_API_KEY || ''
+ ).trim();
 
+ const LIVE_BACKUP_MS = Math.max(
+   3,
+   Number(process.env.FOOTBALL_DATA_LIVE_MIN) || 5
+ ) * 60000;
 
- const LIVE_SCORE_API_KEY = (process.env.API_FOOTBALL_KEY || '').trim();
- const LIVE_SCORE_INTERVAL_MIN = Math.max(15, Number(process.env.API_FOOTBALL_LIVE_MIN) || 15);
- const LIVE_SCORE_GRACE_MS = Math.max(35, LIVE_SCORE_INTERVAL_MIN * 2 + 5) * 60 * 1000;
- const KNOWN_IN_PLAY = new Set(['1H', '2H', 'HT', 'ET', 'BT', 'P', 'LIVE', 'INT']);
- const KNOWN_FINISHED = new Set(['FT', 'AET', 'PEN']);
- const KNOWN_NOT_STARTED = new Set(['NS', 'TBD', 'PST', 'CANC', 'ABD']);
-
- // Prevent unstarted fixtures being incorrectly marked live.
- const previousHasLiveSignal = hasLiveSignal;
- hasLiveSignal = function (row) {
-   if (KNOWN_NOT_STARTED.has(String(row && row.statusRaw || '').toUpperCase())) return false;
-   return previousHasLiveSignal(row);
+ const liveBackupInfo = {
+   enabled: Boolean(LIVE_BACKUP_KEY),
+   lastCheck: null,
+   lastSuccess: null,
+   matches: 0,
+   error: null
  };
 
- // Keep genuinely live reports active between provider updates.
- const previousEffectiveStatus = effectiveStatus;
- effectiveStatus = function (date, time, state, hasLive, observedAt, rawStatus) {
-   const raw = String(rawStatus || '').toUpperCase();
-   if (KNOWN_IN_PLAY.has(raw) && observedAt && Date.now() - observedAt < LIVE_SCORE_GRACE_MS) {
-     return 'LIVE';
-   }
-   return previousEffectiveStatus(date, time, state, hasLive, observedAt, rawStatus);
- };
+ let liveBackupBusy = false;
 
- // Older fixture feeds must not overwrite fresh live scores.
- const previousMergeIntoCache = mergeIntoCache;
- mergeIntoCache = function (incoming) {
-   const recent = new Map();
-   const currentTime = Date.now();
+ function liveBackupName(name) {
+   return String(name || '')
+     .toLowerCase()
+     .normalize('NFKD')
+     .replace(/[\u0300-\u036f]/g, '')
+     .replace(/\b(fc|afc|cf|sc|football club)\b/g, '')
+     .replace(/[^a-z0-9]/g, '');
+ }
 
-   for (const row of incoming || []) {
-     if (!row.homeTeam || !row.awayTeam) continue;
+ async function refreshFootballDataLive() {
+   if (!LIVE_BACKUP_KEY || liveBackupBusy) return;
 
-     const key = matchKey(row.homeTeam, row.awayTeam);
-     const old = store.matches[key];
-     const raw = String(row.statusRaw || '').toUpperCase();
-     const genuinelyFinished =
-       KNOWN_FINISHED.has(raw) || (!raw && row.status === 'FT');
-
-     if (
-       old &&
-       old.status === 'LIVE' &&
-       old.elapsedAt &&
-       currentTime - old.elapsedAt < LIVE_SCORE_GRACE_MS &&
-       !KNOWN_IN_PLAY.has(raw) &&
-       !genuinelyFinished
-     ) {
-       recent.set(key, {
-         homeScore: old.home && old.home.score,
-         awayScore: old.away && old.away.score,
-         elapsed: old.elapsed,
-         elapsedAt: old.elapsedAt,
-         statusRaw: old.statusRaw,
-         statusLong: old.statusLong
-       });
-     }
-   }
-
-   const count = previousMergeIntoCache(incoming);
-
-   for (const [key, old] of recent) {
-     const item = store.matches[key];
-     if (!item) continue;
-
-     item.status = 'LIVE';
-     item.home.score = old.homeScore;
-     item.away.score = old.awayScore;
-     item.elapsed = old.elapsed;
-     item.elapsedAt = old.elapsedAt;
-     item.statusRaw = old.statusRaw;
-     item.statusLong = old.statusLong;
-   }
-
-   return count;
- };
-
- let liveScorePolling = false;
-
- const liveScoreHealth = {
-   enabled: !!LIVE_SCORE_API_KEY,
-   lastRun: null,
-   lastOk: null,
-   lastError: null,
-   lastCount: 0
- };
-
- async function pollIndependentLiveScores() {
-   if (!LIVE_SCORE_API_KEY || liveScorePolling) return;
-
-   liveScorePolling = true;
-   liveScoreHealth.lastRun = new Date().toISOString();
+   liveBackupBusy = true;
+   liveBackupInfo.lastCheck = new Date().toISOString();
 
    try {
-     const result = await httpRequest(
+     const response = await httpRequest(
        'GET',
-       'https://v3.football.api-sports.io/fixtures?live=all',
+       'https://api.football-data.org/v4/matches?status=LIVE',
        {
          headers: {
-           'x-apisports-key': LIVE_SCORE_API_KEY,
+           'X-Auth-Token': LIVE_BACKUP_KEY,
            Accept: 'application/json'
          },
          timeout: 20000
        }
      );
 
-     if (result.status !== 200) {
-       throw new Error('API-Football HTTP ' + result.status);
-     }
-
-     const payload = JSON.parse(result.text);
-
-     if (payload.errors && Object.keys(payload.errors).length) {
+     if (response.status !== 200) {
        throw new Error(
-         'API-Football: ' + JSON.stringify(payload.errors).slice(0, 180)
+         'football-data.org HTTP ' + response.status
        );
      }
 
-     if (!Array.isArray(payload.response)) {
-       throw new Error('Missing fixtures response');
+     const result = JSON.parse(response.text);
+
+     if (!Array.isArray(result.matches)) {
+       throw new Error('Invalid live fixture response');
      }
 
-     const matches = [];
+     let count = 0;
 
-     for (const row of payload.response) {
-       const fixture = row.fixture || {};
-       const home = (row.teams || {}).home || {};
-       const away = (row.teams || {}).away || {};
-       const raw = String(
-         (fixture.status || {}).short || ''
-       ).toUpperCase();
-
-       if (!KNOWN_IN_PLAY.has(raw) || !home.name || !away.name) {
+     for (const match of result.matches) {
+       if (!['IN_PLAY', 'PAUSED', 'LIVE'].includes(match.status)) {
          continue;
        }
 
-       const kickedOff = new Date(fixture.date);
+       const home = match.homeTeam || {};
+       const away = match.awayTeam || {};
+       const time = new Date(match.utcDate || '');
 
-       if (Number.isNaN(kickedOff.getTime())) {
+       if (
+         !home.name ||
+         !away.name ||
+         Number.isNaN(time.getTime())
+       ) {
          continue;
        }
 
-       const goals = row.goals || {};
+       const date = time.toISOString().slice(0, 10);
+       const hhmm = time.toISOString().slice(11, 16);
+       const raw = match.status === 'PAUSED' ? 'HT' : '1H';
 
-       matches.push({
-         date: kickedOff.toISOString().slice(0, 10),
-         time: kickedOff.toISOString().slice(11, 16),
+       const score =
+         (match.score || {}).fullTime ||
+         (match.score || {}).halfTime ||
+         {};
 
-         homeTeam: home.name,
-         awayTeam: away.name,
+       const existingKey = Object.keys(store.matches).find(key => {
+         const old = store.matches[key];
 
-         homeLogo: home.logo || '',
-         awayLogo: away.logo || '',
+         return (
+           old &&
+           old.date === date &&
+           old.home &&
+           old.away &&
+           liveBackupName(old.home.name) === liveBackupName(home.name) &&
+           liveBackupName(old.away.name) === liveBackupName(away.name)
+         );
+       });
 
-         league: (row.league || {}).name || '',
-         country: (row.league || {}).country || '',
-         leagueLogo: (row.league || {}).logo || '',
-         countryFlag: (row.league || {}).flag || '',
+       const existing = existingKey && store.matches[existingKey];
+       const key = existingKey || matchKey(home.name, away.name);
 
-         score:
-           goals.home != null && goals.away != null
-             ? `${goals.home}-${goals.away}`
-             : '',
+       const homeScore = Number.isInteger(score.home)
+         ? score.home
+         : (existing?.home?.score ?? null);
+
+       const awayScore = Number.isInteger(score.away)
+         ? score.away
+         : (existing?.away?.score ?? null);
+
+       store.matches[key] = {
+         ...(existing || {}),
+         id: key,
+
+         date: existing?.date || date,
+         time: existing?.time || hhmm,
+
+         home: {
+           ...(existing?.home || {}),
+           name: existing?.home?.name || home.name,
+           logo: existing?.home?.logo || home.crest || '',
+           score: homeScore
+         },
+
+         away: {
+           ...(existing?.away || {}),
+           name: existing?.away?.name || away.name,
+           logo: existing?.away?.logo || away.crest || '',
+           score: awayScore
+         },
+
+         leagueName:
+           existing?.leagueName ||
+           (match.competition || {}).name ||
+           '',
+
+         leagueId: existing?.leagueId ?? null,
 
          status: 'LIVE',
          statusRaw: raw,
-         statusLong: (fixture.status || {}).long || '',
-         elapsed: (fixture.status || {}).elapsed ?? null,
 
-         hasOdds: false
-       });
+         statusLong:
+           match.status === 'PAUSED'
+             ? 'Half Time'
+             : 'In Play',
+
+         elapsed: Number.isInteger(match.minute)
+           ? match.minute
+           : (existing?.elapsed ?? null),
+
+         elapsedAt: Date.now(),
+         lastSeenAt: Date.now()
+       };
+
+       count++;
      }
 
-     if (matches.length) {
-       mergeIntoCache(matches);
-
-       // Keep official live status and elapsed time.
-       const polledAt = Date.now();
-
-       for (const row of matches) {
-         const item = store.matches[
-           matchKey(row.homeTeam, row.awayTeam)
-         ];
-
-         if (!item) continue;
-
-         item.status = 'LIVE';
-         item.statusRaw = row.statusRaw;
-         item.statusLong = row.statusLong;
-         item.elapsed = row.elapsed;
-         item.elapsedAt = polledAt;
-       }
-
+     if (count) {
        saveCache();
 
-       // Invalidate the 30-second website response cache.
-       _scoresCache = { body: null, at: 0 };
+       if (typeof _scoresCache !== 'undefined') {
+         _scoresCache = {
+           body: null,
+           at: 0
+         };
+       }
      }
 
-     liveScoreHealth.lastOk = new Date().toISOString();
-     liveScoreHealth.lastError = null;
-     liveScoreHealth.lastCount = matches.length;
+     liveBackupInfo.lastSuccess = new Date().toISOString();
+     liveBackupInfo.error = null;
+     liveBackupInfo.matches = count;
 
      console.log(
-       `[live-backup] ${matches.length} in-play games from API-Football`
+       '[live-backup] football-data.org: ' +
+       count +
+       ' in-play matches'
      );
+
    } catch (error) {
-     liveScoreHealth.lastError = String(error.message || error);
+     liveBackupInfo.error = error.message;
+
      console.error(
-       '[live-backup] failed:',
-       liveScoreHealth.lastError
+       '[live-backup] ' + error.message
      );
+
    } finally {
-     liveScorePolling = false;
+     liveBackupBusy = false;
    }
  }
 
- // Independent health endpoint.
- app.get('/api/live-health', (_req, res) => {
+ app.get('/api/live-backup-health', (_req, res) => {
    res.set('Cache-Control', 'no-store');
-   res.json(liveScoreHealth);
+   res.json(liveBackupInfo);
  });
 
- // Start backup live polling.
- if (LIVE_SCORE_API_KEY) {
-   setTimeout(pollIndependentLiveScores, 8000);
+ if (LIVE_BACKUP_KEY) {
+   setTimeout(refreshFootballDataLive, 8000);
 
    setInterval(
-     pollIndependentLiveScores,
-     LIVE_SCORE_INTERVAL_MIN * 60000
+     refreshFootballDataLive,
+     LIVE_BACKUP_MS
    ).unref();
+
  } else {
    console.warn(
-     '[live-backup] Set API_FOOTBALL_KEY in Railway Variables to enable live games'
+     '[live-backup] FOOTBALL_DATA_API_KEY is missing'
    );
  }
 
- // ===== END LIVE-SCORE REPAIR =====
+ // === END INDEPENDENT LIVE-SCORES BACKUP ===
