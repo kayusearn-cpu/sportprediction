@@ -4,9 +4,7 @@
  // Required Railway variable: API_FOOTBALL_KEY=your_api_football_key
  // Optional: API_FOOTBALL_LIVE_MIN=15
 
- if (!ALLOWED_HOSTS.includes('magicbettingtips.com')) {
-   ALLOWED_HOSTS.push('magicbettingtips.com');
- }
+
 
  const LIVE_SCORE_API_KEY = (process.env.API_FOOTBALL_KEY || '').trim();
  const LIVE_SCORE_INTERVAL_MIN = Math.max(15, Number(process.env.API_FOOTBALL_LIVE_MIN) || 15);
