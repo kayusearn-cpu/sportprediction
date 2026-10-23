@@ -98,10 +98,14 @@ const FOREBET_PRED_KEEP_MS = 36 * 60 * 60 * 1000;
 let _forebetPausedUntil = 0;
 let _forebetPauseReason = '';
 function forebetPaused() { return Date.now() < _forebetPausedUntil; }
-function pauseForebet(reason) {
-  _forebetPausedUntil = Date.now() + FOREBET_PAUSE_MS;
+const FOREBET_BUSY_PAUSE_MS = parseInt(process.env.FOREBET_BUSY_PAUSE_MIN || '3', 10) * 60 * 1000;
+function pauseForebet(reason, ms = FOREBET_PAUSE_MS) {
+  _forebetPausedUntil = Date.now() + ms;
   _forebetPauseReason = reason;
-  console.error(`[forebet] paused for ${FOREBET_PAUSE_MS / 60000} min: ${reason}. Pitch backup keeps the site running. Renew/replace BROWSERLESS_TOKEN and redeploy to resume immediately.`);
+  const hint = ms === FOREBET_PAUSE_MS
+    ? ' Renew/replace BROWSERLESS_TOKEN and redeploy to resume immediately.'
+    : ' Will retry automatically.';
+  console.error(`[forebet] paused for ${Math.round(ms / 60000)} min: ${reason}. Pitch backup keeps the site running.${hint}`);
 }
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
@@ -1832,18 +1836,37 @@ const FOREBET_FAIL_TTL_MS = 15 * 60 * 1000;                                     
 // Fetch a Cloudflare-protected Forebet page via Browserless /unblock (returns the final
 // rendered HTML after the anti-bot challenge is solved). Slower than /content but it's the
 // only method that still gets through Forebet's Cloudflare.
-async function fetchForebetUnblock(targetUrl) {
+// Browserless plans allow only a few browsers at once, and an /unblock call can take a
+// minute or more while Cloudflare is solved. So Forebet pages are fetched ONE AT A TIME
+// through this queue (scheduler + standings share it) — overlapping calls were what
+// triggered HTTP 429 "too many concurrent sessions".
+let _unblockQueue = Promise.resolve();
+const FOREBET_TIMEOUT_MS = parseInt(process.env.FOREBET_TIMEOUT_SEC || '110', 10) * 1000;
+function fetchForebetUnblock(targetUrl) {
+  const run = _unblockQueue.then(() => _fetchForebetUnblockNow(targetUrl));
+  _unblockQueue = run.catch(() => {});   // a failure must not block the next page
+  return run;
+}
+async function _fetchForebetUnblockNow(targetUrl) {
   if (!BROWSERLESS_TOKEN) return '';
   if (forebetPaused()) throw new Error(`Forebet paused: ${_forebetPauseReason}`);
-  const url = `https://${BROWSERLESS_UNBLOCK_HOST}/unblock?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
+  // `timeout` caps the browser session on Browserless's side so it is released (and stops
+  // using units) before our own request times out.
+  const url = `https://${BROWSERLESS_UNBLOCK_HOST}/unblock?token=${encodeURIComponent(BROWSERLESS_TOKEN)}&timeout=${FOREBET_TIMEOUT_MS - 10000}`;
   const { status, text } = await httpRequest('POST', url, {
-    body: { url: targetUrl, content: true, cookies: false, screenshot: false, ttl: 45000 },
-    timeout: 75000,
+    // No `ttl`: keeping the browser alive after the call held a concurrency slot open.
+    body: { url: targetUrl, content: true, cookies: false, screenshot: false },
+    timeout: FOREBET_TIMEOUT_MS,
   });
-  // 401/403 = bad or expired token, 402 = plan/units exhausted, 429 = over the plan's limit.
-  if ([401, 402, 403, 429].includes(status)) {
+  // 401/403 = bad or expired token, 402 = plan/units exhausted → long pause.
+  if ([401, 402, 403].includes(status)) {
     pauseForebet(`Browserless HTTP ${status} (token expired, invalid or out of units)`);
     throw new Error(`Forebet paused: Browserless HTTP ${status}`);
+  }
+  // 429 = too many browsers at once / rate limit → only a short breather.
+  if (status === 429) {
+    pauseForebet('Browserless HTTP 429 (too many requests at once)', FOREBET_BUSY_PAUSE_MS);
+    throw new Error('Forebet busy: Browserless HTTP 429');
   }
   if (status !== 200 || !text) throw new Error(`unblock HTTP ${status}: ${String(text).slice(0, 100)}`);
   try { return JSON.parse(text).content || ''; } catch (e) { return text; }
