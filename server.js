@@ -80,34 +80,6 @@ const BROWSERLESS_HOST = process.env.BROWSERLESS_HOST || 'chrome.browserless.io'
 const BROWSERLESS_UNBLOCK_HOST = process.env.BROWSERLESS_UNBLOCK_HOST || 'production-sfo.browserless.io';
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '';
 
-// ---- Forebet as the PRIMARY source -------------------------------------------
-// Forebet's predictions are the main data; pitchpredictions is the free backup that
-// fills gaps (logos, odds, extra fixtures) and keeps the site alive when Forebet is
-// unreachable. Forebet only gets through Cloudflare via Browserless /unblock, so it
-// needs BROWSERLESS_TOKEN. Set FOREBET_PRIMARY=false to go back to pitch-only.
-const FOREBET_PRIMARY = (process.env.FOREBET_PRIMARY || 'true').toLowerCase() !== 'false';
-const FOREBET_LIVE_MIN = parseInt(process.env.FOREBET_LIVE_MIN || '10', 10);
-const FOREBET_TODAY_MIN = parseInt(process.env.FOREBET_TODAY_MIN || '30', 10);
-const FOREBET_FUTURE_MIN = parseInt(process.env.FOREBET_FUTURE_MIN || '180', 10);
-const FOREBET_PAST_MIN = parseInt(process.env.FOREBET_PAST_MIN || '360', 10);
-// When Browserless says the token is invalid/expired/out of units, stop calling it for
-// this long (one log line) instead of failing — and spamming the logs — every few minutes.
-const FOREBET_PAUSE_MS = parseInt(process.env.FOREBET_PAUSE_MIN || '360', 10) * 60 * 1000;
-// A Forebet prediction stays the one shown for this long even while pitch keeps refreshing.
-const FOREBET_PRED_KEEP_MS = 36 * 60 * 60 * 1000;
-let _forebetPausedUntil = 0;
-let _forebetPauseReason = '';
-function forebetPaused() { return Date.now() < _forebetPausedUntil; }
-const FOREBET_BUSY_PAUSE_MS = parseInt(process.env.FOREBET_BUSY_PAUSE_MIN || '3', 10) * 60 * 1000;
-function pauseForebet(reason, ms = FOREBET_PAUSE_MS) {
-  _forebetPausedUntil = Date.now() + ms;
-  _forebetPauseReason = reason;
-  const hint = ms === FOREBET_PAUSE_MS
-    ? ' Renew/replace BROWSERLESS_TOKEN and redeploy to resume immediately.'
-    : ' Will retry automatically.';
-  console.error(`[forebet] paused for ${Math.round(ms / 60000)} min: ${reason}. Pitch backup keeps the site running.${hint}`);
-}
-
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 // OpenAI text-extraction fallback (for sources with no __NEXT_DATA__). OFF by
@@ -126,8 +98,21 @@ const CACHE_FILE = process.env.CACHE_FILE || '/tmp/sportprediction-cache.json';
 // anyone can embed your Railway URL on their website and freeload off your data.
 // Set in Railway env vars, e.g.:
 //   ALLOWED_ORIGINS=https://magicbettingtips.com,https://magicbettingtips.netlify.app
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+//
+// Our OWN sites are always trusted (baked in below) so the API keeps working
+// through the domain migration — old domain, new domain, and both Netlify
+// project URLs — even if the env var is never updated. host-suffix matching
+// (see hostOk) means the apex, www, and deploy-preview subdomains are covered.
+const DEFAULT_ALLOWED = [
+  'magicsportanalysis.com',
+  'magicsportanalysis.netlify.app',
+  'magicbettingtips.com',
+  'magicbettingtips.netlify.app',
+];
+const ALLOWED_ORIGINS = [
+  ...DEFAULT_ALLOWED,
+  ...(process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
+];
 
 // In-memory cache (merged across sources). Single source of truth.
 const store = { matches: {}, preds: {} };
@@ -553,8 +538,7 @@ function predictScore(preds, h, d, a, result, pick) {
 // it stays upcoming until real data arrives, then flips to FT once clearly over.
 // A live-games datapoint stays "fresh" a bit longer than its own poll interval, so a
 // single missed poll never drops a match out of LIVE.
-// Forebet's live page is polled less often than pitch's live feed, so its live data must stay fresh longer.
-const LIVE_FRESH_MS = (Math.max(LIVE_GAMES_MIN, FOREBET_PRIMARY ? FOREBET_LIVE_MIN : 0) * 2 + 3) * 60 * 1000;
+const LIVE_FRESH_MS = (LIVE_GAMES_MIN * 2 + 3) * 60 * 1000;
 function effectiveStatus(date, time, srcStatus, hasLive, elapsedAt, statusRaw) {
   const raw = String(statusRaw || '').toUpperCase();
   const finishedRaw = ['FT', 'AET', 'PEN'].includes(raw);
@@ -931,16 +915,6 @@ const TOP_LEAGUES = (process.env.TOP_LEAGUES || '1:world-cup')
 function getSources() {
   const PP = 'https://www.pitchpredictions.com';
   const list = [];
-  // PRIMARY: Forebet pages via Browserless /unblock. Pitch sources below are the backup.
-  if (FOREBET_PRIMARY && BROWSERLESS_TOKEN) {
-    const FB = 'https://www.forebet.com/en';
-    list.push(
-      { name: 'forebet-live', kind: 'forebet', dayOffset: 0, url: `${FB}/live-football-tips`, intervalMin: FOREBET_LIVE_MIN, tier: 'forebet', useBrowser: true },
-      { name: 'forebet-today', kind: 'forebet', dayOffset: 0, url: `${FB}/football-tips-and-predictions-for-today`, intervalMin: FOREBET_TODAY_MIN, tier: 'forebet', useBrowser: true },
-      { name: 'forebet-tomorrow', kind: 'forebet', dayOffset: 1, url: `${FB}/football-tips-and-predictions-for-tomorrow`, intervalMin: FOREBET_FUTURE_MIN, tier: 'forebet', useBrowser: true },
-      { name: 'forebet-yesterday', kind: 'forebet', dayOffset: -1, url: `${FB}/football-predictions-from-yesterday`, intervalMin: FOREBET_PAST_MIN, tier: 'forebet', useBrowser: true },
-    );
-  }
   // Spine: one JSON-API call per date in the window (full slate + odds per day).
   for (const off of API_DATE_OFFSETS) {
     list.push({
@@ -988,95 +962,50 @@ function mergeIntoCache(list) {
   const newMatches = { ...store.matches };
   const newPreds = { ...store.preds };
   let merged = 0;
-  // Forebet and pitch spell team names differently ("Brisbane Roar" vs "Brisbane Roar FC"),
-  // so an exact key miss falls back to a fuzzy same-day lookup. Index by date (built lazily).
-  let byDate = null;
-  const dayShift = (iso, n) => { const t = Date.parse(`${iso}T12:00:00Z`); return isNaN(t) ? '' : new Date(t + n * 86400000).toISOString().slice(0, 10); };
-  const findSameMatch = (p) => {
-    if (!p.date) return null;
-    if (!byDate) {
-      byDate = {};
-      for (const key of Object.keys(newMatches)) {
-        const dt = newMatches[key].date;
-        if (dt) (byDate[dt] = byDate[dt] || []).push(key);
-      }
-    }
-    // ±1 day because the two sites may show kickoff in different time zones.
-    for (const dt of [p.date, dayShift(p.date, -1), dayShift(p.date, 1)]) {
-      for (const key of byDate[dt] || []) {
-        const m = newMatches[key];
-        if (m && m.home && m.away && teamNameMatch(m.home.name, p.homeTeam) && teamNameMatch(m.away.name, p.awayTeam)) return key;
-      }
-    }
-    return null;
-  };
   for (const p of list) {
     if (!p.homeTeam || !p.awayTeam) continue;
     p.status = effectiveStatus(p.date, p.time, p.status, hasLiveSignal(p), p.elapsed != null ? Date.now() : p.elapsedAt, p.statusRaw);
     if (ONLY_WITH_ODDS && !p.hasOdds && p.status === 'NS') continue;
-    let k = matchKey(p.homeTeam, p.awayTeam);
-    if (!newMatches[k]) {
-      const alt = findSameMatch(p);
-      if (alt) k = alt;
-    }
-    const isNew = !newMatches[k];
+    const k = matchKey(p.homeTeam, p.awayTeam);
     // Fall back to the previous prediction if this row arrives without one (e.g. a
     // status-only refresh) so a live update never blanks the numbers on the card.
-    const prevP = newPreds[k] || {};
+    const prevP = store.preds[k] || {};
+    const h = clampPct(p.probHome) || prevP.h || 0;
+    const d = clampPct(p.probDraw) || prevP.d || 0;
+    const a = clampPct(p.probAway) || prevP.a || 0;
     // Preserve existing record so a partial re-scrape (e.g. status-only) keeps detail fields.
-    const prev = newMatches[k] || {};
-    // Forebet is the primary source: once Forebet has predicted a match, the pitch backup
-    // only refreshes scores/status/logos/odds and never replaces Forebet's numbers.
-    const fromForebet = p.source === 'forebet';
-    const keepForebetPred = !fromForebet && prev.predSource === 'forebet' && Date.now() - (prev.predAt || 0) < FOREBET_PRED_KEEP_MS;
-    const h = keepForebetPred ? (prevP.h || 0) : (clampPct(p.probHome) || prevP.h || 0);
-    const d = keepForebetPred ? (prevP.d || 0) : (clampPct(p.probDraw) || prevP.d || 0);
-    const a = keepForebetPred ? (prevP.a || 0) : (clampPct(p.probAway) || prevP.a || 0);
-    const predSource = keepForebetPred || fromForebet ? 'forebet' : 'pitch';
-    const predAt = keepForebetPred ? prev.predAt : Date.now();
-    // Never move a match backwards (FT → LIVE/NS, LIVE → NS): pitch sometimes keeps
-    // in-play games on a stale "NS" while Forebet already shows them live.
-    const rank = { NS: 0, LIVE: 1, FT: 2 };
-    const prevRank = rank[prev.status], newRank = rank[p.status];
-    const keepPrevStatus = prevRank != null && newRank != null && newRank < prevRank;
-    const hs = parseScore(p.score, 0), as = parseScore(p.score, 1);
-    const prevHs = prev.home ? prev.home.score : null, prevAs = prev.away ? prev.away.score : null;
-    // Forebet rows have no logos/ids and may use another time zone, so keep pitch's
-    // names, kickoff time and artwork when pitch already knows the match.
-    const keepPitchMeta = fromForebet && !isNew;
+    const prev = store.matches[k] || {};
     newMatches[k] = {
       id: k,
-      date: keepPitchMeta ? (prev.date || p.date || '') : (p.date || ''),
-      time: keepPitchMeta ? (prev.time || p.time || '') : (p.time || ''),
+      date: p.date || '',
+      time: p.time || '',
       home: {
-        name: keepPitchMeta ? ((prev.home && prev.home.name) || p.homeTeam) : p.homeTeam,
-        score: hs != null ? hs : prevHs,
-        logo: p.homeLogo || (prev.home && prev.home.logo) || '',
+        name: p.homeTeam,
+        score: parseScore(p.score, 0),
+        logo: p.homeLogo || '',
         id: p.homeTeamId != null ? p.homeTeamId : (prev.home && prev.home.id) || null,
       },
       away: {
-        name: keepPitchMeta ? ((prev.away && prev.away.name) || p.awayTeam) : p.awayTeam,
-        score: as != null ? as : prevAs,
-        logo: p.awayLogo || (prev.away && prev.away.logo) || '',
+        name: p.awayTeam,
+        score: parseScore(p.score, 1),
+        logo: p.awayLogo || '',
         id: p.awayTeamId != null ? p.awayTeamId : (prev.away && prev.away.id) || null,
       },
-      leagueName: keepPitchMeta ? (prev.leagueName || p.league || '') : (p.league || prev.leagueName || ''),
+      leagueName: p.league || '',
       leagueId: p.leagueId != null ? p.leagueId : (prev.leagueId != null ? prev.leagueId : null),
-      leagueLogo: p.leagueLogo || prev.leagueLogo || '',
+      leagueLogo: p.leagueLogo || '',
       country: p.country || prev.country || '',
       countryFlag: p.countryFlag || prev.countryFlag || '',
-      status: keepPrevStatus ? prev.status : p.status,
-      prediction: keepForebetPred ? (prev.prediction || '') : (p.prediction || prev.prediction || ''),
-      correctScore: keepForebetPred ? (prev.correctScore || '') : (p.correctScore || prev.correctScore || ''),
-      advice: keepForebetPred ? (prev.advice || '') : (p.advice || prev.advice || ''),
-      predSource,
-      predAt,
+      status: p.status,
+      prediction: p.prediction || prev.prediction || '',
+      correctScore: p.correctScore || prev.correctScore || '',
+      advice: p.advice || prev.advice || '',
       // NEW: live timer + detail-modal data
       fixtureId: p.fixtureId != null ? p.fixtureId : prev.fixtureId || null,
-      statusRaw: keepPrevStatus ? (prev.statusRaw || '') : (p.statusRaw || prev.statusRaw || ''),
-      statusLong: keepPrevStatus ? (prev.statusLong || '') : (p.statusLong || prev.statusLong || ''),
-      elapsed: !keepPrevStatus && p.elapsed != null ? p.elapsed : prev.elapsed,
-      elapsedAt: !keepPrevStatus && p.elapsed != null ? Date.now() : prev.elapsedAt || null,
+      statusRaw: p.statusRaw || prev.statusRaw || '',
+      statusLong: p.statusLong || prev.statusLong || '',
+      elapsed: p.elapsed != null ? p.elapsed : prev.elapsed,
+      elapsedAt: p.elapsed != null ? Date.now() : prev.elapsedAt || null,
       htScore: (p.htScoreHome != null && p.htScoreAway != null) ? `${p.htScoreHome}-${p.htScoreAway}` : prev.htScore || '',
       recommendation: p.recommendation || prev.recommendation || '',
       avgGoals: p.avgGoals != null ? p.avgGoals : prev.avgGoals,
@@ -1096,10 +1025,10 @@ function mergeIntoCache(list) {
     };
     newPreds[k] = {
       h, d, a,
-      score: keepForebetPred ? (prevP.score || '') : (p.correctScore || prevP.score || ''),
-      advice: keepForebetPred ? (prevP.advice || '') : (p.advice || (p.prediction === '1' ? 'Home Win' : p.prediction === '2' ? 'Away Win' : p.prediction === 'X' ? 'Draw' : '')),
+      score: p.correctScore || prevP.score || '',
+      advice: p.advice || (p.prediction === '1' ? 'Home Win' : p.prediction === '2' ? 'Away Win' : p.prediction === 'X' ? 'Draw' : ''),
       confidence: Math.round(Math.max(h, d, a) / 10) / 10,
-      sources: [predSource],
+      sources: ['scraped'],
       aiUsed: true,
     };
     merged++;
@@ -1173,13 +1102,8 @@ async function scrapeOne(src, trigger = 'scheduler') {
     console.log(`[scrape ${src.name}] already running, skipping`);
     return { skipped: true };
   }
-  const st = (sourceState[src.name] = sourceState[src.name] || {});
-  // Forebet paused (expired/exhausted Browserless token): skip quietly, pitch carries on.
-  if (src.kind === 'forebet' && forebetPaused()) {
-    st.lastError = `paused: ${_forebetPauseReason}`;
-    return { skipped: true, paused: true };
-  }
   runningSources.add(src.name);
+  const st = (sourceState[src.name] = sourceState[src.name] || {});
   st.lastRun = new Date().toISOString();
   const _startTarget = src.url
     || (src.kind === 'league' ? `league ${src.leagueId}`
@@ -1192,12 +1116,7 @@ async function scrapeOne(src, trigger = 'scheduler') {
     //   otherwise  → scrape an HTML page's __NEXT_DATA__ (country feeds; also harvests
     //                per-match detail URLs for on-demand H2H).
     let list;
-    if (src.kind === 'forebet') {
-      const html = await fetchForebetUnblock(src.url);
-      if (!html || isCloudflareChallenge(html)) throw new Error('Forebet page empty or still behind Cloudflare');
-      list = parseForebetFixtures(html, src.dayOffset).map(forebetFixtureToP).filter(p => p.homeTeam && p.awayTeam);
-      console.log(`[scrape ${src.name}] Forebet → ${list.length} matches`);
-    } else if (src.kind === 'api') {
+    if (src.kind === 'api') {
       const date = isoDateOffset(src.apiOffset);
       list = await fetchFixturesByDate(date);
       console.log(`[scrape ${src.name}] API ${date} → ${list.length} fixtures`);
@@ -1306,10 +1225,7 @@ async function runFullScrape(trigger = 'manual') {
 // one — not all ~20 country feeds at the same instant every hour (which is what got
 // the server's IP Cloudflare-blocked). Requests trickle out one every ~15s instead.
 function startTieredScheduler() {
-  const tierRank = { forebet: -1, live: 0, future: 1, past: 2, primary: 3 };
-  if (FOREBET_PRIMARY && !BROWSERLESS_TOKEN) {
-    console.warn('[forebet] primary source OFF: BROWSERLESS_TOKEN is not set. Running on the pitch backup only.');
-  }
+  const tierRank = { live: 0, future: 1, past: 2, primary: 3 };
   const sources = getSources().slice().sort((a, b) => (tierRank[a.tier] ?? 9) - (tierRank[b.tier] ?? 9));
   const GAP_MS = Math.max(3, parseInt(process.env.SCRAPE_GAP_SEC || '15', 10)) * 1000;
   console.log(`[scheduler] ${sources.length} source(s) scheduled — staggered ${GAP_MS / 1000}s apart (live tier first):`);
@@ -1836,38 +1752,13 @@ const FOREBET_FAIL_TTL_MS = 15 * 60 * 1000;                                     
 // Fetch a Cloudflare-protected Forebet page via Browserless /unblock (returns the final
 // rendered HTML after the anti-bot challenge is solved). Slower than /content but it's the
 // only method that still gets through Forebet's Cloudflare.
-// Browserless plans allow only a few browsers at once, and an /unblock call can take a
-// minute or more while Cloudflare is solved. So Forebet pages are fetched ONE AT A TIME
-// through this queue (scheduler + standings share it) — overlapping calls were what
-// triggered HTTP 429 "too many concurrent sessions".
-let _unblockQueue = Promise.resolve();
-const FOREBET_TIMEOUT_MS = parseInt(process.env.FOREBET_TIMEOUT_SEC || '110', 10) * 1000;
-function fetchForebetUnblock(targetUrl) {
-  const run = _unblockQueue.then(() => _fetchForebetUnblockNow(targetUrl));
-  _unblockQueue = run.catch(() => {});   // a failure must not block the next page
-  return run;
-}
-async function _fetchForebetUnblockNow(targetUrl) {
+async function fetchForebetUnblock(targetUrl) {
   if (!BROWSERLESS_TOKEN) return '';
-  if (forebetPaused()) throw new Error(`Forebet paused: ${_forebetPauseReason}`);
-  // `timeout` caps the browser session on Browserless's side so it is released (and stops
-  // using units) before our own request times out.
-  const url = `https://${BROWSERLESS_UNBLOCK_HOST}/unblock?token=${encodeURIComponent(BROWSERLESS_TOKEN)}&timeout=${FOREBET_TIMEOUT_MS - 10000}`;
+  const url = `https://${BROWSERLESS_UNBLOCK_HOST}/unblock?token=${encodeURIComponent(BROWSERLESS_TOKEN)}`;
   const { status, text } = await httpRequest('POST', url, {
-    // No `ttl`: keeping the browser alive after the call held a concurrency slot open.
-    body: { url: targetUrl, content: true, cookies: false, screenshot: false },
-    timeout: FOREBET_TIMEOUT_MS,
+    body: { url: targetUrl, content: true, cookies: false, screenshot: false, ttl: 45000 },
+    timeout: 75000,
   });
-  // 401/403 = bad or expired token, 402 = plan/units exhausted → long pause.
-  if ([401, 402, 403].includes(status)) {
-    pauseForebet(`Browserless HTTP ${status} (token expired, invalid or out of units)`);
-    throw new Error(`Forebet paused: Browserless HTTP ${status}`);
-  }
-  // 429 = too many browsers at once / rate limit → only a short breather.
-  if (status === 429) {
-    pauseForebet('Browserless HTTP 429 (too many requests at once)', FOREBET_BUSY_PAUSE_MS);
-    throw new Error('Forebet busy: Browserless HTTP 429');
-  }
   if (status !== 200 || !text) throw new Error(`unblock HTTP ${status}: ${String(text).slice(0, 100)}`);
   try { return JSON.parse(text).content || ''; } catch (e) { return text; }
 }
@@ -1908,7 +1799,7 @@ async function fetchForebetStandings(leagueId) {
     if (hit.data && age < FOREBET_TTL_MS) return hit.data;        // fresh success
     if (!hit.data && age < FOREBET_FAIL_TTL_MS) return null;      // recent miss — don't hammer Browserless
   }
-  if (!BROWSERLESS_TOKEN || forebetPaused() || _forebetInflight.has(key)) return hit && hit.data ? hit.data : null;
+  if (!BROWSERLESS_TOKEN || _forebetInflight.has(key)) return hit && hit.data ? hit.data : null;
   _forebetInflight.add(key);                  // avoid duplicate /unblock calls for the same league
   const target = `https://www.forebet.com/en/football-tips-and-predictions-for-${path}`;
   let data = null;
@@ -1929,7 +1820,7 @@ async function fetchForebetStandings(leagueId) {
 // When pitch (our fast/free JSON source) is down, we backfill TODAY's slate by
 // scraping Forebet's "today" predictions page (fixtures + 1X2 % + predicted score
 // + live/FT scores). Each match row is a <div class="rcnt"> with schema.org markup.
-function parseForebetFixtures(html, dayOffset = 0) {
+function parseForebetFixtures(html) {
   const rows = String(html).split('<div class="rcnt').slice(1);
   const out = [];
   for (const row of rows) {
@@ -1938,12 +1829,8 @@ function parseForebetFixtures(html, dayOffset = 0) {
     let away = (row.match(/awayTeam"[^>]*>\s*<span[^>]*>([^<]+)</) || [])[1] || nameMeta[2];
     if (!home || !away) continue;
     const dISO = (row.match(/<time datetime="([^"]+)"/) || [])[1] || '';
-    const tM = row.match(/date_bah[^>]*>\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})/);
-    const time = tM ? `${tM[4].padStart(2, '0')}:${tM[5]}` : '';
-    // Plain YYYY-MM-DD: from the visible dd/mm/yyyy, else the <time> tag, else the page's day.
-    const date = tM ? `${tM[3]}-${tM[2].padStart(2, '0')}-${tM[1].padStart(2, '0')}`
-      : /^\d{4}-\d{2}-\d{2}/.test(dISO) ? dISO.slice(0, 10)
-      : isoDateOffset(dayOffset);
+    const tM = row.match(/date_bah[^>]*>\s*\d{1,2}\/\d{1,2}\/\d{4}\s+(\d{1,2}):(\d{2})/);
+    const time = tM ? `${tM[1].padStart(2, '0')}:${tM[2]}` : '';
     const pr = row.match(/fprc"[^>]*>\s*<span[^>]*>(\d+)<\/span>\s*<span[^>]*>(\d+)<\/span>\s*<span[^>]*>(\d+)<\/span>/);
     const pick = (row.match(/forepr"[^>]*>\s*<span[^>]*>([^<]+)</) || [])[1] || '';
     const predScore = ((row.match(/ex_sc tabonly">([^<]+)</) || [])[1] || '').replace(/\s/g, '');
@@ -1958,7 +1845,7 @@ function parseForebetFixtures(html, dayOffset = 0) {
       else { status = 'LIVE'; const em = lmin.match(/(\d{1,3})/); elapsed = em ? parseInt(em[1], 10) : 1; }
     }
     out.push({
-      home: _cleanText(home), away: _cleanText(away), date, time,
+      home: _cleanText(home), away: _cleanText(away), dISO, time,
       probs: pr ? [parseInt(pr[1], 10), parseInt(pr[2], 10), parseInt(pr[3], 10)] : null,
       pick, predScore, scoreStr: scoreM ? `${scoreM[1]}-${scoreM[2]}` : '',
       status, elapsed,
@@ -1972,7 +1859,7 @@ function parseForebetFixtures(html, dayOffset = 0) {
 function forebetFixtureToP(m) {
   const h = m.probs ? m.probs[0] : 0, d = m.probs ? m.probs[1] : 0, a = m.probs ? m.probs[2] : 0;
   return {
-    homeTeam: m.home, awayTeam: m.away, date: m.date, time: m.time,
+    homeTeam: m.home, awayTeam: m.away, date: m.dISO || new Date().toISOString().slice(0, 10), time: m.time,
     score: m.scoreStr, status: m.status,
     statusRaw: m.status === 'LIVE' ? String(m.elapsed || '') : m.status,
     elapsed: m.status === 'LIVE' ? (m.elapsed || null) : (m.status === 'FT' ? 90 : null),
@@ -1986,9 +1873,7 @@ function forebetFixtureToP(m) {
 
 let _forebetFixturesCache = { at: 0, data: [] };
 async function fetchForebetFixtures() {
-  if (!BROWSERLESS_TOKEN || forebetPaused()) return [];
-  // When Forebet already runs as the primary source, this outage fallback is redundant.
-  if (FOREBET_PRIMARY) return [];
+  if (!BROWSERLESS_TOKEN) return [];
   if (_forebetFixturesCache.data.length && Date.now() - _forebetFixturesCache.at < FOREBET_FALLBACK_MS) return _forebetFixturesCache.data;
   const target = 'https://www.forebet.com/en/football-tips-and-predictions-for-today';
   const html = await fetchForebetUnblock(target);
@@ -2439,7 +2324,6 @@ app.post('/api/admin/filter', originGate, (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`⚽ Prediction scraper live on :${PORT}`);
   console.log(`   cadence: live=${LIVE_REFRESH_MIN}min  future=${FUTURE_REFRESH_MIN}min  past=${PAST_REFRESH_MIN}min`);
-  console.log(`   forebet: ${FOREBET_PRIMARY ? (BROWSERLESS_TOKEN ? `PRIMARY (live=${FOREBET_LIVE_MIN}min today=${FOREBET_TODAY_MIN}min future=${FOREBET_FUTURE_MIN}min past=${FOREBET_PAST_MIN}min)` : 'PRIMARY but OFF — BROWSERLESS_TOKEN not set') : 'disabled'}  (pitch = backup)`);
   console.log(`   primary: ${ENABLE_PRIMARY ? 'ENABLED (' + TARGET_URL + ')' : 'disabled'}`);
   console.log(`   fallback=${FALLBACK_URL}  browserless=${BROWSERLESS_HOST}`);
   loadCache();
