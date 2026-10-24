@@ -104,8 +104,9 @@ const CACHE_FILE = process.env.CACHE_FILE || '/tmp/sportprediction-cache.json';
 // project URLs — even if the env var is never updated. host-suffix matching
 // (see hostOk) means the apex, www, and deploy-preview subdomains are covered.
 const DEFAULT_ALLOWED = [
-  'magicsportanalysis.com',
-  'magicsportanalysis.netlify.app',
+  'magicsportsanalysis.com',        // LIVE custom domain — note the "s" (magic SPORTS analysis)
+  'magicsportanalysis.netlify.app', // Netlify project subdomain that serves it
+  'magicsportanalysis.com',         // old no-s spelling (now dead) — harmless to keep
   'magicbettingtips.com',
   'magicbettingtips.netlify.app',
 ];
